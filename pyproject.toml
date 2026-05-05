@@ -1,0 +1,39 @@
+[project]
+name = "nonavox"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "chainner-ext>=0.3.10",
+    "diso>=0.1.4",
+    "gdown>=6.0.0",
+    "itk>=5.4.6",
+    "monai-generative>=0.2.3",
+    "monai[lpips]>=1.5.2",
+    "niivue-streamlit>=0.2.2b9",
+    "numpy>=2.4.4",
+    "opencv-python>=4.13.0.92",
+    "plotly>=6.7.0",
+    "pydicom>=3.0.2",
+    "pyvista>=0.47.3",
+    "stpyvista>=0.2.1",
+    "streamlit[charts]>=1.56.0",
+    "tensorboard>=2.20.0",
+    "tomlkit>=0.14.0",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "totalsegmentator>=2.13.0",
+    "trimesh>=4.12.1",
+    "warp-lang>=1.12.1",
+]
+
+[tool.ruff]
+line-length = 150
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.format]
+quote-style = "single"
