@@ -32,6 +32,7 @@ excluded = [
     "3099401_L",
     "3099401_R",
     "3942322_L",
+    "4455888_L",
 ]
 
 [dataset]
@@ -42,7 +43,6 @@ root = "/config/workspace/public-ssd/train-tha"
 
 [train.vae]
 use_amp = true
-resume = true
 num_workers = 8
 num_epochs = 200
 warmup_epochs = 2
@@ -55,21 +55,21 @@ lr_d = 0.0002
 adversarial_weight = 0.05
 perceptual_weight = 0.3
 eikonal_weight = 0.15
+interior_weight = 10.0
 kl_weight = 0.03
 
-[train.ldm]
+[train.lfm]
 use_amp = true
 resume = false
 num_workers = 8
 num_epochs = 1000
 val_interval = 1
-val_limit = 50
-batch_size = 48
+batch_size = 24
 sw_batch_size = 12
 lr = 0.0001
 gradient_accumulation_steps = 16
 ema_decay = 0.999
-cfg = 3.0
+classifier_free_guidence = 3.0
 
 [val]
 3239892_L = "Stryker Accolade TMZF"

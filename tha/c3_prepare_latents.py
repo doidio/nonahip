@@ -37,7 +37,7 @@ def main():
         print(f'VAE {subtask}')
         print(f'Loading checkpoint from {load_pt}...')
         try:
-            checkpoint = torch.load(load_pt, map_location=device, weights_only=True)
+            checkpoint = torch.load(load_pt, map_location=device, weights_only=False)
             channels = int(checkpoint['channels'])
             print(f'Channels: {channels}')
 
@@ -70,16 +70,15 @@ def main():
 
     pre_dir = dataset_root / 'pre'
     metal_dir = dataset_root / 'metal'
-    out_dir = latents_root
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    latents_root.mkdir(parents=True, exist_ok=True)
     pre_files = sorted(list(pre_dir.glob('*.nii.gz')))
 
     for pre_path in tqdm(pre_files):
         name = pre_path.name.removesuffix('.nii.gz')
         cup_path = metal_dir / f'{name}_cup.nii.gz'
         stem_path = metal_dir / f'{name}_stem.nii.gz'
-        save_path = out_dir / f'{name}.npy'
+        save_path = latents_root / f'{name}.npy'
 
         z_channels = []
         for path, vae, transforms in [

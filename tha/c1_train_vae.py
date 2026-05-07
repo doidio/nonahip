@@ -21,7 +21,7 @@ from monai.data import DataLoader, Dataset
 from monai.inferers import sliding_window_inference
 from monai.losses import PatchAdversarialLoss
 from monai.metrics import PSNRMetric, SSIMMetric
-from monai.transforms import Compose
+from monai.transforms import Compose, SaveImage
 from PIL import Image
 from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
@@ -35,6 +35,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', required=True)
     parser.add_argument('--subtask', required=True)
+    parser.add_argument('--resume', default=False, action='store_true')
+    parser.add_argument('--new_best', default=False, action='store_true')
     args = parser.parse_args()
 
     cfg = tomlkit.loads(Path(args.config).read_text('utf-8')).unwrap()
@@ -51,8 +53,9 @@ def main():
     subtask = args.subtask
     print('Subtask:', subtask)
 
+    resume = bool(args.resume)
+
     use_amp = bool(config_train['use_amp'])
-    resume = bool(config_train['resume'])
     num_workers = int(config_train['num_workers'])
     num_epochs = int(config_train['num_epochs'])
     warmup_epochs = int(config_train['warmup_epochs'])
@@ -63,21 +66,26 @@ def main():
     adv_weight = float(config_train['adversarial_weight'])
     per_weight = float(config_train['perceptual_weight'])
     eik_weight = float(config_train['eikonal_weight'])
+    interior_weight = float(config_train['interior_weight'])
     kl_weight = float(config_train['kl_weight'])
     lr_g = float(config_train['lr_g'])
     lr_d = float(config_train['lr_d'])
 
-    val_prls, test_prls = set(cfg['val']), set(cfg['test'])
+    val_prls, test_prls = set(cfg['val'].keys()), set(cfg['test'].keys())
     train_files, val_files, test_files = [], [], []
 
     for f in (dataset_root / subtask).glob('*.nii.gz'):
         prl = '_'.join(f.name.removesuffix('.nii.gz').split('_')[:2])
+        if prl in cfg['pairs']['excluded']:
+            continue
         if prl in test_prls:
-            test_files.append({'image': f.as_posix()})
+            test_files.append({'image': f.as_posix(), 'prl': prl})
         elif prl in val_prls:
-            val_files.append({'image': f.as_posix()})
+            val_files.append({'image': f.as_posix(), 'prl': prl})
         else:
-            train_files.append({'image': f.as_posix()})
+            train_files.append({'image': f.as_posix(), 'prl': prl})
+
+    val_prl = val_files[0]['prl'] if len(val_files) else None
 
     print('Train:\t', len(train_files))
     print('Val:\t', len(val_files))
@@ -143,6 +151,15 @@ def main():
     log_dir = log_dir / suffix
     writer = SummaryWriter(log_dir=log_dir.as_posix())
 
+    saver = SaveImage(
+        output_dir=log_dir,
+        output_postfix='',
+        output_ext='.nii.gz',
+        separate_folder=False,
+        print_log=False,
+        resample=False,
+    )
+
     start_epoch = 0
     best_val_l1 = float('inf')
 
@@ -166,7 +183,7 @@ def main():
                 scaler_g.load_state_dict(checkpoint['scaler_g'])
                 scaler_d.load_state_dict(checkpoint['scaler_d'])
 
-            start_epoch = checkpoint['epoch'] + 1
+            start_epoch = checkpoint['epoch']
             best_val_l1 = checkpoint.get('best_val_l1', float('inf'))
 
             print('Epoch:\t', start_epoch)
@@ -176,6 +193,9 @@ def main():
             print('Scale Factor:\t', checkpoint.get('scale_factor'))
             print('Global Mean:\t', checkpoint.get('global_mean'))
             start_epoch += 1
+
+            if args.new_best:
+                best_val_l1 = float('inf')
         except Exception as e:
             raise SystemError(f'Load failed: {e}')
 
@@ -205,6 +225,7 @@ def main():
             kl_loss = torch.tensor(0.0, device=device)
             adv_loss = torch.tensor(0.0, device=device)
             eik_loss = torch.tensor(0.0, device=device)
+            interior_loss = torch.tensor(0.0, device=device)
             loss_d = torch.tensor(0.0, device=device)
 
             optimizer_g.zero_grad(set_to_none=True)
@@ -287,6 +308,13 @@ def main():
                             eik_loss = torch.sum(eik_mask * (grad_norm - target_norm) ** 2) / (eik_mask.sum() + 1e-8)
                             loss_g += eik_loss * eik_weight
 
+                        # 3. 内部实心度约束 (Interior Loss)
+                        # 防止在大面积常数区域(特别是实心金属)发生特征塌陷
+                        solid_mask = (images >= 1.0).float()
+                        if solid_mask.sum() > 0:
+                            interior_loss = torch.sum(solid_mask * (reconstruction.float() - images.float()) ** 2) / (solid_mask.sum() + 1e-8)
+                            loss_g += interior_loss * interior_weight
+
             if use_amp:
                 scaler_g.scale(loss_g).backward()
                 scaler_g.unscale_(optimizer_g)
@@ -339,6 +367,7 @@ def main():
                 'KL': f'{kl_loss.item():.4f}',
                 'Per.': f'{per_loss.item():.4f}',
                 'Eik.': f'{eik_loss.item():.4f}',
+                'Int.': f'{interior_loss.item():.4f}',
                 'Adv.': f'{adv_loss.item():.4f}',
             }
 
@@ -349,6 +378,7 @@ def main():
                 writer.add_scalar('train/kl_loss', kl_loss.item(), global_step)
                 writer.add_scalar('train/per_loss', per_loss.item(), global_step)
                 writer.add_scalar('train/eik_loss', eik_loss.item(), global_step)
+                writer.add_scalar('train/interior_loss', interior_loss.item(), global_step)
                 writer.add_scalar('train/adv_loss', adv_loss.item(), global_step)
                 writer.add_scalar('latent/z_mu_mean', z_mu.mean().item(), global_step)
                 writer.add_scalar('latent/z_sigma_mean', z_sigma.mean().item(), global_step)
@@ -399,7 +429,13 @@ def main():
                     val_pbar.set_postfix({'L1': f'{v_l1.item():.4f}'})
 
                     # 可视化
-                    if i == 0:
+                    prl = batch['prl'][0]
+                    if prl == val_prl:
+                        name = f'{prl}_{i}_val_epoch_{epoch:03d}'
+
+                        saver(val_images[0].as_tensor().cpu(), meta_data={'filename_or_obj': f'{name}_GT.nii.gz'})
+                        saver(val_recon[0].as_tensor().cpu(), meta_data={'filename_or_obj': f'{name}_Recon.nii.gz'})
+
                         vis_inputs, vis_recons, vis_diffs = [], [], []
                         axis = 1  # 冠状面投影
 
@@ -419,7 +455,7 @@ def main():
 
                             # 差异 DRR
                             diff = np.abs(img_in - img_rec)
-                            drr_diff = fast_drr(diff, axis, th=(0.0, 1.0), mode='max')
+                            drr_diff = fast_drr(diff, axis, th=(0.0, 1.0), mode='mean')
                             drr_diff = np.flipud(drr_diff.transpose(1, 0, 2))
                             vis_diffs.append(drr_diff)
 
@@ -428,16 +464,16 @@ def main():
                         vis_recon = np.hstack(vis_recons)
                         vis_diff = np.hstack(vis_diffs)
 
-                        writer.add_image('val/Input', vis_input, epoch, dataformats='HWC')
-                        writer.add_image('val/Recon', vis_recon, epoch, dataformats='HWC')
-                        writer.add_image('val/Diff', vis_diff, epoch, dataformats='HWC')
+                        writer.add_image(f'val/{name}_Input', vis_input, epoch, dataformats='HWC')
+                        writer.add_image(f'val/{name}_Recon', vis_recon, epoch, dataformats='HWC')
+                        writer.add_image(f'val/{name}_Diff', vis_diff, epoch, dataformats='HWC')
 
                         val_vis_dir = log_dir / 'val'
                         val_vis_dir.mkdir(parents=True, exist_ok=True)
 
-                        Image.fromarray(vis_input).save(val_vis_dir / f'{epoch:04d}_input.png')
-                        Image.fromarray(vis_recon).save(val_vis_dir / f'{epoch:04d}_recon.png')
-                        Image.fromarray(vis_diff).save(val_vis_dir / f'{epoch:04d}_diff.png')
+                        Image.fromarray(vis_input).save(val_vis_dir / f'{name}_Input.png')
+                        Image.fromarray(vis_recon).save(val_vis_dir / f'{name}_Recon.png')
+                        Image.fromarray(vis_diff).save(val_vis_dir / f'{name}_Diff.png')
 
             val_l1_loss /= val_step
             psnr = psnr_metric.aggregate().item()
@@ -454,15 +490,15 @@ def main():
             # 保存
             checkpoint = {
                 'epoch': epoch,
-                'channels': channels,
+                'channels': int(channels),
                 'state_dict': vae.state_dict(),
                 'discriminator': discriminator.state_dict(),
                 'optimizer_g': optimizer_g.state_dict(),
                 'optimizer_d': optimizer_d.state_dict(),
-                'val_l1': val_l1_loss,
-                'val_psnr': psnr,
-                'val_ssim': ssim,
-                'best_val_l1': best_val_l1,
+                'val_l1': float(val_l1_loss),
+                'val_psnr': float(psnr),
+                'val_ssim': float(ssim),
+                'best_val_l1': float(best_val_l1),
             }
 
             if use_amp:

@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from monai.losses import PerceptualLoss
 from monai.networks.nets import AutoencoderKL, DiffusionModelUNet, PatchDiscriminator
-from monai.networks.schedulers import DDIMScheduler, DDPMScheduler
+from monai.networks.schedulers import RFlowScheduler
 from monai.transforms import (
     CopyItemsd,
     DeleteItemsd,
@@ -150,7 +150,7 @@ class ScaleLatentd(MapTransform):
         return d
 
 
-def ldm_collate_fn(batch):
+def lfm_collate_fn(batch):
     """
     Latent 尺寸不一致，ListBatch 策略比 Padding 到固定较大尺寸更好
     list 虽然不是 GPU 并行，但节省了不必要的 Padding 背景计算，同时保留了随机尺寸的泛化能力
@@ -161,7 +161,7 @@ def ldm_collate_fn(batch):
     }
 
 
-def ldm_transforms(image_mean, image_sf, cond_mean, cond_sf):
+def lfm_transforms(image_mean, image_sf, cond_mean, cond_sf):
     return [
         LoadLatentConditiond(keys=['image']),
         ScaleLatentd(
@@ -174,7 +174,7 @@ def ldm_transforms(image_mean, image_sf, cond_mean, cond_sf):
     ]
 
 
-def ldm_unet():
+def lfm_unet():
     return DiffusionModelUNet(
         spatial_dims=3,
         in_channels=12,
@@ -188,25 +188,8 @@ def ldm_unet():
     )
 
 
-def scheduler_ddpm():
-    return DDPMScheduler(
-        num_train_timesteps=1000,
-        schedule='scaled_linear_beta',
-        prediction_type='epsilon',
-        # beta_start=0.00085,  # LDM 标准参数
-        # beta_end=0.012,  # LDM 标准参数
-    )
-
-
-def scheduler_ddim():
-    return DDIMScheduler(
-        num_train_timesteps=1000,
-        schedule='scaled_linear_beta',
-        prediction_type='epsilon',
-        # beta_start=0.00085,
-        # beta_end=0.012,
-        clip_sample=False,
-    )
+def scheduler_rflow():
+    return RFlowScheduler(num_train_timesteps=1000)
 
 
 class EMA:
