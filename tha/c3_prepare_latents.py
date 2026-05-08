@@ -75,10 +75,13 @@ def main():
     pre_files = sorted(list(pre_dir.glob('*.nii.gz')))
 
     for pre_path in tqdm(pre_files):
-        name = pre_path.name.removesuffix('.nii.gz')
-        cup_path = metal_dir / f'{name}_cup.nii.gz'
-        stem_path = metal_dir / f'{name}_stem.nii.gz'
-        save_path = latents_root / f'{name}.npy'
+        prl = '_'.join(pre_path.name.removesuffix('.nii.gz').split('_')[:2])
+        if prl in cfg['pairs']['excluded']:
+            continue
+
+        cup_path = metal_dir / f'{prl}_cup.nii.gz'
+        stem_path = metal_dir / f'{prl}_stem.nii.gz'
+        save_path = latents_root / f'{prl}.npy'
 
         z_channels = []
         for path, vae, transforms in [

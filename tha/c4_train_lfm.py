@@ -334,7 +334,7 @@ def main():
 
                     prl = batch['prl'][0]
                     if prl == val_prl:
-                        name = f'{prl}_{i}_val_epoch_{epoch:03d}'
+                        name = f'{prl}_{i}'
 
                         num_inference_steps = 50
                         scheduler.set_timesteps(num_inference_steps=num_inference_steps)
@@ -363,9 +363,9 @@ def main():
                                 generated, _ = scheduler.step(velocity_pred, t, generated, next_t)
 
                         with amp_ctx:
-                            vis_generated = decode(generated, f'{name}_Gen', vae_image, image_sf, image_mean, epoch)
-                            vis_gt = decode(image, f'{name}_GT', vae_image, image_sf, image_mean, epoch)
-                            vis_cond = decode(cond, f'{name}_Cond', vae_cond, cond_sf, cond_mean, epoch)
+                            vis_generated = decode(generated, f'{name}_val_epoch_{epoch:03d}_Gen', vae_image, image_sf, image_mean, epoch)
+                            vis_gt = decode(image, f'{name}_val_epoch_{epoch:03d}_GT', vae_image, image_sf, image_mean, epoch)
+                            vis_cond = decode(cond, f'{name}_val_epoch_{epoch:03d}_Cond', vae_cond, cond_sf, cond_mean, epoch)
 
                         # DRR Visualization (Refer to VAE style)
                         axis = 1
@@ -388,9 +388,9 @@ def main():
                         writer.add_image(f'val/{name}_GT', drr_gt, epoch, dataformats='HWC')
                         writer.add_image(f'val/{name}_Cond', drr_cond, epoch, dataformats='HWC')
 
-                        Image.fromarray(drr_gen).save(val_vis_dir / f'{name}_Gen.png')
-                        Image.fromarray(drr_gt).save(val_vis_dir / f'{name}_GT.png')
-                        Image.fromarray(drr_cond).save(val_vis_dir / f'{name}_Cond.png')
+                        Image.fromarray(drr_gen).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_Gen.png')
+                        Image.fromarray(drr_gt).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_GT.png')
+                        Image.fromarray(drr_cond).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_Cond.png')
 
                         # Diff DRR (hstack)
                         diff_drrs = []
@@ -401,7 +401,7 @@ def main():
 
                         drr_diff_hstack = np.hstack(diff_drrs)
                         writer.add_image(f'val/Diff_{i}', drr_diff_hstack, epoch, dataformats='HWC')
-                        Image.fromarray(drr_diff_hstack).save(val_vis_dir / f'{name}_Diff.png')
+                        Image.fromarray(drr_diff_hstack).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_Diff.png')
 
             ema.restore(lfm)
             avg_val_loss = val_loss / val_steps

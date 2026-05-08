@@ -16,7 +16,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
-    """Numpy implementation of the Frechet Distance."""
+    """Numpy implementation of the Frechet Distance with stability improvements."""
     mu1 = np.atleast_1d(mu1)
     mu2 = np.atleast_1d(mu2)
 
@@ -28,22 +28,27 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
 
     diff = mu1 - mu2
 
-    # Product might be almost singular
-    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
-    if not np.isfinite(covmean).all():
-        msg = f'fid calculation produces singular product; adding {eps} to diagonal of cov estimates'
-        print(msg)
-        offset = np.eye(sigma1.shape[0]) * eps
-        covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+    # 1. 稳定性优化：主动添加 epsilon 确保矩阵正定，消除奇异性警告
+    offset = np.eye(sigma1.shape[0]) * eps
+    s1, s2 = sigma1 + offset, sigma2 + offset
 
-    # Numerical error might give slight imaginary component
-    if np.iscomplexobj(covmean):
-        if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
-            m = np.max(np.abs(covmean.imag))
-            raise ValueError(f'Imaginary component {m}')
-        covmean = covmean.real
-
-    tr_covmean = np.trace(covmean)
+    # 2. 算法优化：利用对称性计算 Tr(sqrt(S1 @ S2))
+    # 这种方法比通用的 linalg.sqrtm 更稳定，且避免了已弃用的 'disp' 参数
+    try:
+        # 计算 S1 的平方根
+        w1, v1 = linalg.eigh(s1)
+        s1_sqrt = v1 @ np.diag(np.sqrt(np.maximum(w1, 0))) @ v1.T
+        
+        # 计算对称乘积 sqrt(S1) @ S2 @ sqrt(S1) 的平方根特征值
+        m = s1_sqrt @ s2 @ s1_sqrt
+        wm, _ = linalg.eigh(m)
+        tr_covmean = np.sum(np.sqrt(np.maximum(wm, 0)))
+    except (ValueError, linalg.LinAlgError):
+        # 极端情况下的兜底方案，移除 disp 参数以保持兼容
+        covmean = linalg.sqrtm(s1.dot(s2))
+        if np.iscomplexobj(covmean):
+            covmean = covmean.real
+        tr_covmean = np.trace(covmean)
 
     return diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean
 
@@ -103,7 +108,9 @@ def main():
     train_files = []
 
     for f in (dataset_root / subtask).glob('*.nii.gz'):
-        prl = '_'.join(f.name.split('_')[:2])
+        prl = '_'.join(f.name.removesuffix('.nii.gz').split('_')[:2])
+        if prl in cfg['pairs']['excluded']:
+            continue
         if prl not in test_prls and prl not in val_prls:
             train_files.append({'image': f.as_posix()})
     print(f'Train: {len(train_files)}')
@@ -241,7 +248,12 @@ def main():
     torch.save(checkpoint, load_pt)
 
     print(f'\n--- Summary for {subtask} ---')
+    print('Epoch:\t', checkpoint['epoch'])
+    print('L1:   \t', checkpoint['val_l1'], 'best', checkpoint['best_val_l1'])
+    print('PSNR:\t', checkpoint['val_psnr'])
+    print('SSIM:\t', checkpoint['val_ssim'])
     print(f'Scale Factor: {scale_factor:.6f}')
+    print(f'Global Mean: {global_mean:.6f}')
     print(f'r{m_name} (Reconstruction): {r_val:.6f}')
     print(f'i{m_name} (Interpolation):  {i_val:.6f}')
     print(f'Ratio (i/r): {ratio:.2f}x')

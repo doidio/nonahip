@@ -66,7 +66,8 @@ def main():
     adv_weight = float(config_train['adversarial_weight'])
     per_weight = float(config_train['perceptual_weight'])
     eik_weight = float(config_train['eikonal_weight'])
-    interior_weight = float(config_train['interior_weight'])
+    solid_weight = float(config_train['solid_weight'])
+    fg_weight = float(config_train['fg_weight'])
     kl_weight = float(config_train['kl_weight'])
     lr_g = float(config_train['lr_g'])
     lr_d = float(config_train['lr_d'])
@@ -225,7 +226,8 @@ def main():
             kl_loss = torch.tensor(0.0, device=device)
             adv_loss = torch.tensor(0.0, device=device)
             eik_loss = torch.tensor(0.0, device=device)
-            interior_loss = torch.tensor(0.0, device=device)
+            solid_loss = torch.tensor(0.0, device=device)
+            fg_loss = torch.tensor(0.0, device=device)
             loss_d = torch.tensor(0.0, device=device)
 
             optimizer_g.zero_grad(set_to_none=True)
@@ -308,12 +310,17 @@ def main():
                             eik_loss = torch.sum(eik_mask * (grad_norm - target_norm) ** 2) / (eik_mask.sum() + 1e-8)
                             loss_g += eik_loss * eik_weight
 
-                        # 3. 内部实心度约束 (Interior Loss)
+                        # 3. 内部实心度约束 (Solid Loss)
                         # 防止在大面积常数区域(特别是实心金属)发生特征塌陷
                         solid_mask = (images >= 1.0).float()
                         if solid_mask.sum() > 0:
-                            interior_loss = torch.sum(solid_mask * (reconstruction.float() - images.float()) ** 2) / (solid_mask.sum() + 1e-8)
-                            loss_g += interior_loss * interior_weight
+                            solid_loss = torch.sum(solid_mask * (reconstruction.float() - images.float()) ** 2) / (solid_mask.sum() + 1e-8)
+                            loss_g += solid_loss * solid_weight
+
+                    fg_mask = (images >= -0.95).float()
+                    if fg_mask.sum() > 0:
+                        fg_loss = torch.sum(fg_mask * (reconstruction.float() - images.float()) ** 2) / (fg_mask.sum() + 1e-8)
+                        loss_g += fg_loss * fg_weight
 
             if use_amp:
                 scaler_g.scale(loss_g).backward()
@@ -367,7 +374,8 @@ def main():
                 'KL': f'{kl_loss.item():.4f}',
                 'Per.': f'{per_loss.item():.4f}',
                 'Eik.': f'{eik_loss.item():.4f}',
-                'Int.': f'{interior_loss.item():.4f}',
+                'Sol.': f'{solid_loss.item():.4f}',
+                'FG.': f'{fg_loss.item():.4f}',
                 'Adv.': f'{adv_loss.item():.4f}',
             }
 
@@ -378,7 +386,8 @@ def main():
                 writer.add_scalar('train/kl_loss', kl_loss.item(), global_step)
                 writer.add_scalar('train/per_loss', per_loss.item(), global_step)
                 writer.add_scalar('train/eik_loss', eik_loss.item(), global_step)
-                writer.add_scalar('train/interior_loss', interior_loss.item(), global_step)
+                writer.add_scalar('train/solid_loss', solid_loss.item(), global_step)
+                writer.add_scalar('train/fg_loss', fg_loss.item(), global_step)
                 writer.add_scalar('train/adv_loss', adv_loss.item(), global_step)
                 writer.add_scalar('latent/z_mu_mean', z_mu.mean().item(), global_step)
                 writer.add_scalar('latent/z_sigma_mean', z_sigma.mean().item(), global_step)
@@ -431,10 +440,10 @@ def main():
                     # 可视化
                     prl = batch['prl'][0]
                     if prl == val_prl:
-                        name = f'{prl}_{i}_val_epoch_{epoch:03d}'
+                        name = f'{prl}_{i}'
 
-                        saver(val_images[0].as_tensor().cpu(), meta_data={'filename_or_obj': f'{name}_GT.nii.gz'})
-                        saver(val_recon[0].as_tensor().cpu(), meta_data={'filename_or_obj': f'{name}_Recon.nii.gz'})
+                        saver(val_images[0].as_tensor().cpu(), meta_data={'filename_or_obj': f'{name}_val_epoch_{epoch:03d}_GT.nii.gz'})
+                        saver(val_recon[0].as_tensor().cpu(), meta_data={'filename_or_obj': f'{name}_val_epoch_{epoch:03d}_Recon.nii.gz'})
 
                         vis_inputs, vis_recons, vis_diffs = [], [], []
                         axis = 1  # 冠状面投影
@@ -444,18 +453,18 @@ def main():
                             img_rec = val_recon[0, c].cpu().numpy()
 
                             # 输入 DRR
-                            drr_in = fast_drr(img_in + 1.0, axis, th=(0.0, 2.0), mode='mean')
+                            drr_in = fast_drr(img_in + 1.0, axis, th=(0.1, 2.0), mode='mean')
                             drr_in = np.flipud(drr_in.transpose(1, 0, 2))
                             vis_inputs.append(drr_in)
 
                             # 重建 DRR
-                            drr_rec = fast_drr(img_rec + 1.0, axis, th=(0.0, 2.0), mode='mean')
+                            drr_rec = fast_drr(img_rec + 1.0, axis, th=(0.1, 2.0), mode='mean')
                             drr_rec = np.flipud(drr_rec.transpose(1, 0, 2))
                             vis_recons.append(drr_rec)
 
                             # 差异 DRR
                             diff = np.abs(img_in - img_rec)
-                            drr_diff = fast_drr(diff, axis, th=(0.0, 1.0), mode='mean')
+                            drr_diff = fast_drr(diff + 1.0, axis, th=(0.1, 2.0), mode='mean')
                             drr_diff = np.flipud(drr_diff.transpose(1, 0, 2))
                             vis_diffs.append(drr_diff)
 
@@ -471,9 +480,9 @@ def main():
                         val_vis_dir = log_dir / 'val'
                         val_vis_dir.mkdir(parents=True, exist_ok=True)
 
-                        Image.fromarray(vis_input).save(val_vis_dir / f'{name}_Input.png')
-                        Image.fromarray(vis_recon).save(val_vis_dir / f'{name}_Recon.png')
-                        Image.fromarray(vis_diff).save(val_vis_dir / f'{name}_Diff.png')
+                        Image.fromarray(vis_input).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_Input.png')
+                        Image.fromarray(vis_recon).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_Recon.png')
+                        Image.fromarray(vis_diff).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_Diff.png')
 
             val_l1_loss /= val_step
             psnr = psnr_metric.aggregate().item()

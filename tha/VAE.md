@@ -1,8 +1,39 @@
 # THA 项目 VAE 优化与 LFM 策略备忘录 (VAE Optimization Memo)
 
-**生成日期**: 2026年5月6日
+## VAE 训练结果
 
-本文档记录了关于全髋置换术（THA）项目中，VAE（变分自编码器）作为 LFM（潜在扩散模型）基础前置阶段的核心评估准则与优化策略。
+```
+--- Summary for pre ---                                                                                                 
+Epoch:   83                                                                                                             
+L1:      0.015218866804917885 best 0.015218866804917885
+PSNR:    34.14170455932617
+SSIM:    0.973004162311554
+Scale Factor: 1.738056
+Global Mean: -0.015522
+rFID (Reconstruction): 0.001377
+iFID (Interpolation):  0.004938
+Ratio (i/r): 3.59x
+>> SUCCESS: Low Interpolation Gap. Latent space is continuous.
+```
+
+```
+--- Summary for metal ---
+Epoch:   84
+L1:      0.013140154894181463 best 0.013140154894181463
+PSNR:    39.07928466796875
+SSIM:    0.9883571863174438
+Scale Factor: 4.730453
+Global Mean: -0.001636
+rEikonal (Reconstruction): 0.014490
+iEikonal (Interpolation):  0.012945
+Ratio (i/r): 0.89x
+>> SUCCESS: Low Interpolation Gap. Latent space is continuous.
+```
+
+- Ratio > 1.0
+  - 插值生成的重建效果一般劣于数据集本身的重建效果
+- Ratio < 1.0
+  - 由于 metal 数据集并不是物理完美的，经过 Eikonal 强力正则化，Ratio < 1.0 意味着插值误差更优于数据集本身的物理误差。
 
 ---
 
@@ -51,20 +82,3 @@
 ### 当前架构总结
 目前的配置（`latent_channels=4`, `channels=(32, 64, 128)`）在 3D VRAM 预算极其吃紧的情况下，是一套极具性价比的架构。它将有限的算力留给了负责空间推理和分布学习的 LFM，同时 VAE 凭借物理约束（Eikonal Loss）和对抗训练（PatchGAN）提供了足够鲁棒和连续的潜在空间支撑。
 
-```
---- Summary for pre ---
-Scale Factor: 3.308383
-rFID (Reconstruction): 0.000361
-iFID (Interpolation):  0.008080
-Ratio (i/r): 22.39x
->> WARNING: High Interpolation Gap! Latent space might be fragmented.
-```
-
-```
---- Summary for metal ---
-Scale Factor: 9.637154
-rEikonal (Reconstruction): 0.002639
-iEikonal (Interpolation):  0.004925
-Ratio (i/r): 1.87x
->> SUCCESS: Low Interpolation Gap. Latent space is continuous.
-```
