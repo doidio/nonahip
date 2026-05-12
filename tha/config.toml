@@ -45,7 +45,7 @@ root = "/config/workspace/public-ssd/train-tha"
 use_amp = true
 num_workers = 8
 num_epochs = 200
-warmup_epochs = 2
+warmup_epochs = 5
 val_interval = 1
 batch_size = 12
 patch_size = [128, 128, 128]
@@ -55,17 +55,17 @@ lr_d = 0.0002
 adversarial_weight = 0.05
 perceptual_weight = 0.3
 eikonal_weight = 0.15
-solid_weight = 10.0
-fg_weight = 5.0
+mse_weight = 3.0
+solid_weight = 5.0
 kl_weight = 0.03
 
-[train.lfm]
+[train.rflow]
 use_amp = true
 resume = false
 num_workers = 8
 num_epochs = 1000
 val_interval = 1
-batch_size = 24
+batch_size = 4
 sw_batch_size = 12
 lr = 0.0001
 gradient_accumulation_steps = 16

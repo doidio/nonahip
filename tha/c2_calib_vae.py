@@ -38,7 +38,7 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
         # 计算 S1 的平方根
         w1, v1 = linalg.eigh(s1)
         s1_sqrt = v1 @ np.diag(np.sqrt(np.maximum(w1, 0))) @ v1.T
-        
+
         # 计算对称乘积 sqrt(S1) @ S2 @ sqrt(S1) 的平方根特征值
         m = s1_sqrt @ s2 @ s1_sqrt
         wm, _ = linalg.eigh(m)
@@ -50,7 +50,7 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
             covmean = covmean.real
         tr_covmean = np.trace(covmean)
 
-    return diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean
+    return diff.dot(diff) + np.trace(s1) + np.trace(s2) - 2 * tr_covmean
 
 
 def main():
@@ -232,36 +232,49 @@ def main():
 
         r_val = calculate_frechet_distance(mu_real, sigma_real, np.mean(recon_feats, 0), np.cov(recon_feats, rowvar=False))
         i_val = calculate_frechet_distance(mu_real, sigma_real, np.mean(interp_feats, 0), np.cov(interp_feats, rowvar=False))
-        m_name = 'FID'
-    else:
+        m_name = 'FID (特征分布距离)'
+        # MedicalNet FID 阈值设定
+        threshold_excellent = 0.05
+        threshold_warn = 0.5
+
+    else:  # subtask == 'metal'
         r_val = sum(all_recon_metrics) / N
         i_val = sum(all_interp_metrics) / N
-        m_name = 'Eikonal'
+        m_name = 'Eikonal (距离场梯度MSE)'
+        # TSDF Eikonal 阈值设定
+        threshold_excellent = 0.01
+        threshold_warn = 0.05
 
-    ratio = i_val / (r_val + 1e-12)
+    # 计算绝对差值 (Gap)
+    delta = i_val - r_val
 
     # Save
     checkpoint['scale_factor'] = float(scale_factor)
     checkpoint['global_mean'] = float(global_mean)
-    checkpoint[f'r{m_name.lower()}'] = float(r_val)
-    checkpoint[f'i{m_name.lower()}'] = float(i_val)
+    checkpoint[f'r{m_name.split()[0].lower()}'] = float(r_val)
+    checkpoint[f'i{m_name.split()[0].lower()}'] = float(i_val)
     torch.save(checkpoint, load_pt)
 
     print(f'\n--- Summary for {subtask} ---')
-    print('Epoch:\t', checkpoint['epoch'])
-    print('L1:   \t', checkpoint['val_l1'], 'best', checkpoint['best_val_l1'])
-    print('PSNR:\t', checkpoint['val_psnr'])
-    print('SSIM:\t', checkpoint['val_ssim'])
-    print(f'Scale Factor: {scale_factor:.6f}')
-    print(f'Global Mean: {global_mean:.6f}')
-    print(f'r{m_name} (Reconstruction): {r_val:.6f}')
-    print(f'i{m_name} (Interpolation):  {i_val:.6f}')
-    print(f'Ratio (i/r): {ratio:.2f}x')
+    print(f'Epoch: \t\t {checkpoint.get("epoch", "N/A")}')
+    print(f'L1:    \t\t {checkpoint.get("val_l1", 0):.6f} (Best: {checkpoint.get("best_val_l1", 0):.6f})')
+    print(f'MSE:  \t\t {checkpoint.get("val_mse", 0):.6f}')
+    print(f'PSNR:  \t\t {checkpoint.get("val_psnr", 0):.2f}')
+    print(f'SSIM:  \t\t {checkpoint.get("val_ssim", 0):.4f}')
+    print('-' * 30)
+    print(f'Scale Factor:\t {scale_factor:.6f}')
+    print(f'Global Mean:\t {global_mean:.6f}')
+    print(f'r{m_name.split()[0]} (Recon):\t {r_val:.6f}  <- 越接近 0 模型越好')
+    print(f'i{m_name.split()[0]} (Interp):\t {i_val:.6f}  <- 绝对插值表现')
+    print(f'Gap (i - r): \t {delta:.6f}  <- 插值造成的性能退化量')
+    print('-' * 30)
 
-    if ratio > 10.0:
-        print('>> WARNING: High Interpolation Gap! Latent space might be fragmented.')
+    if delta < threshold_excellent:
+        print(f'>> Δ{m_name.split()[0]} < {threshold_excellent} 隐空间高度平滑连续')
+    elif delta < threshold_warn:
+        print(f'>> Δ{threshold_excellent} <= {m_name.split()[0]} < {threshold_warn} 隐空间插值性能下降')
     else:
-        print('>> SUCCESS: Low Interpolation Gap. Latent space is continuous.')
+        print(f'>> Δ{m_name.split()[0]} >= {threshold_warn} 隐空间严重碎片化')
 
     return scale_factor, i_val
 

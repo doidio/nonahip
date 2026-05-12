@@ -2,6 +2,7 @@ from copy import deepcopy
 
 import numpy as np
 import torch
+from b0_preload_prothesis import FEMORAL
 from monai.losses import PerceptualLoss
 from monai.networks.nets import AutoencoderKL, DiffusionModelUNet, PatchDiscriminator
 from monai.networks.schedulers import RFlowScheduler
@@ -150,7 +151,65 @@ class ScaleLatentd(MapTransform):
         return d
 
 
-def lfm_collate_fn(batch):
+class PrepareContextd(MapTransform):
+    """提取 TOML 中的手术设计参数并转换为 Tensor"""
+
+    def __init__(self, keys, allow_missing_keys=False):
+        super().__init__(keys, allow_missing_keys)
+        self.brands = sorted(list(FEMORAL.keys()))
+        self.brand_to_id = {b: i for i, b in enumerate(self.brands)}
+
+        all_sizes = set()
+        for v in FEMORAL.values():
+            all_sizes.update(v)
+        self.sizes = sorted(list(all_sizes))
+        self.size_to_id = {s: i for i, s in enumerate(self.sizes)}
+
+    def __call__(self, data):
+        d = dict(data)
+        ctx = d.get('context', {})
+
+        # femoral_spec = ["Brand", "Size"]
+        spec = ctx.get('femoral_spec', ['', ''])
+        brand = spec[0] if len(spec) > 0 else ''
+        size = spec[1] if len(spec) > 1 else ''
+
+        brand_id = self.brand_to_id.get(brand, 0)
+        size_id = self.size_to_id.get(size, 0)
+
+        brand_mask = 1.0 if brand else 0.0
+        size_mask = 1.0 if size else 0.0
+
+        # Numerics: [cup_outer, head_outer, head_offset, liner_offset]
+        # 使用 Min-Max 归一化到 [-1, 1] 范围，提高对极端条件的鲁棒性
+        def min_max_scale(val, min_val, max_val):
+            if val is None:
+                return 0.0, 0.0
+            # 线性映射 [min, max] -> [-1, 1]
+            return 2.0 * (float(val) - min_val) / (max_val - min_val) - 1.0, 1.0
+
+        cup_outer = ctx['cup_outer_best'] if 'cup_outer_best' in ctx else ctx.get('cup_outer')
+        head_outer = ctx.get('head_outer')
+        head_offset = ctx.get('head_offset')
+        liner_offset = ctx['liner_offset_best'] if 'liner_offset_best' in ctx else ctx.get('liner_offset')
+
+        cup_outer_val, cup_outer_mask = min_max_scale(cup_outer, 38.0, 62.0)
+        head_outer_val, head_outer_mask = min_max_scale(head_outer, 22.0, 44.0)
+        head_offset_val, head_offset_mask = min_max_scale(head_offset, -5.0, 9.0)
+        liner_offset_val, liner_offset_mask = min_max_scale(liner_offset, 0.0, 6.0)
+
+        nums = [cup_outer_val, head_outer_val, head_offset_val, liner_offset_val]
+        masks = [brand_mask, size_mask, cup_outer_mask, head_outer_mask, head_offset_mask, liner_offset_mask]
+
+        d['brand_id'] = torch.tensor(brand_id, dtype=torch.long)
+        d['size_id'] = torch.tensor(size_id, dtype=torch.long)
+        d['numerics'] = torch.tensor(nums, dtype=torch.float32)
+        d['masks'] = torch.tensor(masks, dtype=torch.float32)
+
+        return d
+
+
+def rflow_collate_fn(batch):
     """
     Latent 尺寸不一致，ListBatch 策略比 Padding 到固定较大尺寸更好
     list 虽然不是 GPU 并行，但节省了不必要的 Padding 背景计算，同时保留了随机尺寸的泛化能力
@@ -158,10 +217,14 @@ def lfm_collate_fn(batch):
     return {
         'image': [item['image'] for item in batch],
         'condition': [item['condition'] for item in batch],
+        'brand_id': torch.stack([item['brand_id'] for item in batch]),
+        'size_id': torch.stack([item['size_id'] for item in batch]),
+        'numerics': torch.stack([item['numerics'] for item in batch]),
+        'masks': torch.stack([item['masks'] for item in batch]),
     }
 
 
-def lfm_transforms(image_mean, image_sf, cond_mean, cond_sf):
+def rflow_transforms(image_mean, image_sf, cond_mean, cond_sf):
     return [
         LoadLatentConditiond(keys=['image']),
         ScaleLatentd(
@@ -171,10 +234,51 @@ def lfm_transforms(image_mean, image_sf, cond_mean, cond_sf):
             cond_mean=cond_mean,
             cond_sf=cond_sf,
         ),
+        PrepareContextd(keys=['context']),
     ]
 
 
-def lfm_unet():
+class ContextEmbedder(torch.nn.Module):
+    """将手术设计参数编码为全局条件向量序列 [B, 6, C]"""
+
+    def __init__(self, embed_dim=256):
+        super().__init__()
+        brands = sorted(list(FEMORAL.keys()))
+        all_sizes = set()
+        for v in FEMORAL.values():
+            all_sizes.update(v)
+        sizes = sorted(list(all_sizes))
+
+        self.brand_emb = torch.nn.Embedding(len(brands), embed_dim)
+        self.size_emb = torch.nn.Embedding(len(sizes), embed_dim)
+
+        # 为每个数值参数配置独立的投影层
+        self.cup_outer_proj = torch.nn.Linear(1, embed_dim)
+        self.head_outer_proj = torch.nn.Linear(1, embed_dim)
+        self.head_offset_proj = torch.nn.Linear(1, embed_dim)
+        self.liner_offset_proj = torch.nn.Linear(1, embed_dim)
+
+    def forward(self, brand_id, size_id, numerics, masks=None):
+        brand_embed = self.brand_emb(brand_id)  # [B, C]
+        size_embed = self.size_emb(size_id)  # [B, C]
+
+        # 分解并投影数值参数
+        cup_outer_embed = self.cup_outer_proj(numerics[:, 0:1])  # [B, C]
+        head_outer_embed = self.head_outer_proj(numerics[:, 1:2])  # [B, C]
+        head_offset_embed = self.head_offset_proj(numerics[:, 2:3])  # [B, C]
+        liner_offset_embed = self.liner_offset_proj(numerics[:, 3:4])  # [B, C]
+
+        # 堆叠成序列，共 6 个 Token [B, 6, C]
+        # 注意顺序: brand, size, cup_outer, head_outer, head_offset, liner_offset
+        out = torch.stack([brand_embed, size_embed, cup_outer_embed, head_outer_embed, head_offset_embed, liner_offset_embed], dim=1)
+
+        if masks is not None:
+            out = out * masks.unsqueeze(-1)
+
+        return out
+
+
+def rflow_unet(context_embedding_size=256):
     return DiffusionModelUNet(
         spatial_dims=3,
         in_channels=12,
@@ -183,7 +287,8 @@ def lfm_unet():
         channels=(64, 128, 256),
         attention_levels=(False, False, True),  # 启用自注意力学习解剖方位关系
         norm_num_groups=32,
-        with_conditioning=False,  # TODO 交叉注意力注入全局条件
+        with_conditioning=True,  # 启用交叉注意力注入全局条件
+        cross_attention_dim=context_embedding_size,
         use_flash_attention=True,
     )
 

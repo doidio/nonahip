@@ -63,11 +63,11 @@ def main():
     patch_size = list(config_train['patch_size'])
     sw_batch_size = int(config_train['sw_batch_size'])
     val_interval = int(config_train['val_interval'])
+    mse_weight = float(config_train['mse_weight'])
     adv_weight = float(config_train['adversarial_weight'])
     per_weight = float(config_train['perceptual_weight'])
     eik_weight = float(config_train['eikonal_weight'])
     solid_weight = float(config_train['solid_weight'])
-    fg_weight = float(config_train['fg_weight'])
     kl_weight = float(config_train['kl_weight'])
     lr_g = float(config_train['lr_g'])
     lr_d = float(config_train['lr_d'])
@@ -227,7 +227,7 @@ def main():
             adv_loss = torch.tensor(0.0, device=device)
             eik_loss = torch.tensor(0.0, device=device)
             solid_loss = torch.tensor(0.0, device=device)
-            fg_loss = torch.tensor(0.0, device=device)
+            mse_loss = torch.tensor(0.0, device=device)
             loss_d = torch.tensor(0.0, device=device)
 
             optimizer_g.zero_grad(set_to_none=True)
@@ -247,7 +247,12 @@ def main():
                 if torch.isnan(l1_loss):
                     raise SystemExit('NaN in l1_loss')
 
-            loss_g = l1_loss
+                # 全局 MSE (L2) 约束，抹平背景噪声，平滑表面梯度
+                mse_loss = torch.nn.functional.mse_loss(reconstruction.float(), images.float())
+                if torch.isnan(mse_loss):
+                    raise SystemExit('NaN in mse_loss')
+
+            loss_g = l1_loss + mse_loss * mse_weight
 
             # 感知损失，退出AMP避免NaN。
             # 过滤掉几乎无变化的平坦背景区域 (std接近0)，避免 MedicalNet 内部归一化除零导致 NaN，
@@ -284,7 +289,7 @@ def main():
                 # 生成器损失
                 loss_g += kl_loss
 
-                # 预热后补充对抗损失和程函损失
+                # 预热后补充对抗损失、程函损失和实心损失
                 if not warmup:
                     # 1. 对抗损失
                     out = discriminator(reconstruction.float())
@@ -311,16 +316,11 @@ def main():
                             loss_g += eik_loss * eik_weight
 
                         # 3. 内部实心度约束 (Solid Loss)
-                        # 防止在大面积常数区域(特别是实心金属)发生特征塌陷
+                        # 在预热后再开启，防止初期梯度过大导致崩溃
                         solid_mask = (images >= 1.0).float()
                         if solid_mask.sum() > 0:
                             solid_loss = torch.sum(solid_mask * (reconstruction.float() - images.float()) ** 2) / (solid_mask.sum() + 1e-8)
                             loss_g += solid_loss * solid_weight
-
-                    fg_mask = (images >= -0.95).float()
-                    if fg_mask.sum() > 0:
-                        fg_loss = torch.sum(fg_mask * (reconstruction.float() - images.float()) ** 2) / (fg_mask.sum() + 1e-8)
-                        loss_g += fg_loss * fg_weight
 
             if use_amp:
                 scaler_g.scale(loss_g).backward()
@@ -375,7 +375,7 @@ def main():
                 'Per.': f'{per_loss.item():.4f}',
                 'Eik.': f'{eik_loss.item():.4f}',
                 'Sol.': f'{solid_loss.item():.4f}',
-                'FG.': f'{fg_loss.item():.4f}',
+                'MSE.': f'{mse_loss.item():.4f}',
                 'Adv.': f'{adv_loss.item():.4f}',
             }
 
@@ -387,7 +387,7 @@ def main():
                 writer.add_scalar('train/per_loss', per_loss.item(), global_step)
                 writer.add_scalar('train/eik_loss', eik_loss.item(), global_step)
                 writer.add_scalar('train/solid_loss', solid_loss.item(), global_step)
-                writer.add_scalar('train/fg_loss', fg_loss.item(), global_step)
+                writer.add_scalar('train/mse_loss', mse_loss.item(), global_step)
                 writer.add_scalar('train/adv_loss', adv_loss.item(), global_step)
                 writer.add_scalar('latent/z_mu_mean', z_mu.mean().item(), global_step)
                 writer.add_scalar('latent/z_sigma_mean', z_sigma.mean().item(), global_step)
@@ -404,6 +404,7 @@ def main():
 
             vae.eval()
             val_l1_loss = 0.0
+            val_mse_loss = 0.0
             psnr_metric = PSNRMetric(max_val=2.0)
             ssim_metric = SSIMMetric(data_range=2.0, spatial_dims=3)
 
@@ -430,12 +431,14 @@ def main():
                         )  # type:ignore
 
                     v_l1 = l1_loss_fn(val_recon.float(), val_images.float())
+                    v_mse = torch.nn.functional.mse_loss(val_recon.float(), val_images.float())
                     val_l1_loss += v_l1.item()
+                    val_mse_loss += v_mse.item()
 
                     psnr_metric(y_pred=val_recon, y=val_images)
                     ssim_metric(y_pred=val_recon, y=val_images)
 
-                    val_pbar.set_postfix({'L1': f'{v_l1.item():.4f}'})
+                    val_pbar.set_postfix({'L1': f'{v_l1.item():.4f}', 'MSE': f'{v_mse.item():.4f}'})
 
                     # 可视化
                     prl = batch['prl'][0]
@@ -485,16 +488,18 @@ def main():
                         Image.fromarray(vis_diff).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_Diff.png')
 
             val_l1_loss /= val_step
+            val_mse_loss /= val_step
             psnr = psnr_metric.aggregate().item()
             ssim = ssim_metric.aggregate().item()
             psnr_metric.reset()
             ssim_metric.reset()
 
             writer.add_scalar('val/l1', val_l1_loss, epoch)
+            writer.add_scalar('val/mse', val_mse_loss, epoch)
             writer.add_scalar('val/psnr', psnr, epoch)
             writer.add_scalar('val/ssim', ssim, epoch)
 
-            print(f'Val Epoch {epoch}: L1={val_l1_loss:.5f} | PSNR={psnr:.4f} | SSIM={ssim:.4f}')
+            print(f'Val Epoch {epoch}: L1={val_l1_loss:.5f} | MSE={val_mse_loss:.5f} | PSNR={psnr:.4f} | SSIM={ssim:.4f}')
 
             # 保存
             checkpoint = {
@@ -505,6 +510,7 @@ def main():
                 'optimizer_g': optimizer_g.state_dict(),
                 'optimizer_d': optimizer_d.state_dict(),
                 'val_l1': float(val_l1_loss),
+                'val_mse': float(val_mse_loss),
                 'val_psnr': float(psnr),
                 'val_ssim': float(ssim),
                 'best_val_l1': float(best_val_l1),

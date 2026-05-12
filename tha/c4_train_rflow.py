@@ -23,19 +23,20 @@ def main():
     torch.backends.cudnn.benchmark = True
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', required=True)
+    parser.add_argument('--resume', default=False, action='store_true')
     args = parser.parse_args()
 
     config_path = Path(args.config)
     cfg = tomlkit.loads(config_path.read_text('utf-8')).unwrap()
 
     train_root = Path(str(cfg['train']['root']))
+    dataset_root = Path(cfg['dataset']['root'])
     log_dir = train_root / 'logs'
     ckpt_dir = train_root / 'checkpoints'
 
-    task = 'lfm'
+    task = 'rflow'
     (
         use_amp,
-        resume,
         num_workers,
         num_epochs,
         val_interval,
@@ -49,7 +50,6 @@ def main():
         cfg['train'][task][_]
         for _ in (
             'use_amp',
-            'resume',
             'num_workers',
             'num_epochs',
             'val_interval',
@@ -72,16 +72,24 @@ def main():
     val_prls, test_prls = set(cfg['val'].keys()), set(cfg['test'].keys())
     train_files, val_files, test_files = [], [], []
 
-    for f in (train_root / 'latents').glob('*.npy'):
-        prl = '_'.join(f.name.removesuffix('.npy').split('_')[:2])
+    for image_file in (train_root / 'latents').glob('*.npy'):
+        prl = '_'.join(image_file.name.removesuffix('.npy').split('_')[:2])
         if prl in cfg['pairs']['excluded']:
             continue
-        if prl in test_prls:
-            test_files.append({'image': f.as_posix(), 'prl': prl})
-        elif prl in val_prls:
-            val_files.append({'image': f.as_posix(), 'prl': prl})
+
+        pid, rl = prl.split('_')
+        f = dataset_root / 'pair' / pid / rl / 'context.toml'
+        if f.exists():
+            it = {'image': image_file.as_posix(), 'prl': prl, 'context': tomlkit.loads(f.read_text('utf-8')).unwrap()}
         else:
-            train_files.append({'image': f.as_posix(), 'prl': prl})
+            raise RuntimeError(f'Non-exist {f.as_posix()}')
+
+        if prl in test_prls:
+            test_files.append(it)
+        elif prl in val_prls:
+            val_files.append(it)
+        else:
+            train_files.append(it)
 
     val_prl = val_files[0]['prl'] if len(val_files) else None
 
@@ -94,25 +102,37 @@ def main():
         print(f'[{subtask}]\t', f'Loading {ckpt_path}')
 
         loaded = torch.load(ckpt_path, map_location=device, weights_only=False)
-        channels = loaded['channels']
-        vae_model = define.vae_kl(channels).to(device)
-        vae_model.load_state_dict(loaded['state_dict'])
-        vae_model.eval().float()
 
         print('Epoch:\t', loaded['epoch'])
+        print('Channels:\t', channels := loaded['channels'])
         print('L1:   \t', loaded['val_l1'], 'best', loaded['best_val_l1'])
         print('PSNR:\t', loaded['val_psnr'])
         print('SSIM:\t', loaded['val_ssim'])
         print('Scale Factor:\t', sf := loaded['scale_factor'])
         print('Global Mean:\t', mean := loaded['global_mean'])
 
-        return vae_model, sf, mean
+        vae = define.vae_kl(channels).to(device)
+        vae.load_state_dict(loaded['state_dict'])
+        vae.eval().float()
+        print('Param:\t {0:.2f} B'.format(sum(p.numel() for p in vae.parameters()) / 1e9))
 
-    vae_image, image_sf, image_mean = load_vae('metal')
+        i_val, r_val = 0.0, 0.0
+        for metric in ('FID', 'Eikonal'):
+            kw = f'i{metric.lower()}'
+            if kw in loaded:
+                print(f'i{metric}:\t', i_val := loaded[kw])
+            kw = f'r{metric.lower()}'
+            if kw in loaded:
+                print(f'r{metric}:\t', r_val := loaded[kw])
+        print('Interp/Recon:\t', i_val / (r_val + 1e-12))
+
+        return vae, sf, mean
+
     vae_cond, cond_sf, cond_mean = load_vae('pre')
+    vae_image, image_sf, image_mean = load_vae('metal')
 
     transforms = Compose(
-        define.lfm_transforms(
+        define.rflow_transforms(
             image_mean=image_mean,
             image_sf=image_sf,
             cond_mean=cond_mean,
@@ -131,27 +151,29 @@ def main():
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=True,
-        collate_fn=define.lfm_collate_fn,
+        collate_fn=define.rflow_collate_fn,
     )
     # 验证 Loader 保持 BS=1 即可
     val_loader = DataLoader(val_ds, batch_size=1, num_workers=num_workers)
 
-    lfm = define.lfm_unet().to(device)
-    ema = define.EMA(lfm, decay=ema_decay)
+    embed_dim = 256
+    rflow = define.rflow_unet(context_embedding_size=embed_dim).to(device)
+    context_embedder = define.ContextEmbedder(embed_dim=embed_dim).to(device)
+    ema = define.EMA(rflow, decay=ema_decay)
 
     scheduler = define.scheduler_rflow()
 
-    optimizer = torch.optim.AdamW(lfm.parameters(), lr=lr, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(list(rflow.parameters()) + list(context_embedder.parameters()), lr=lr, weight_decay=1e-5)
     scaler = GradScaler() if use_amp else None
 
     start_epoch = 0
-    lfm_ckpt_path = (ckpt_dir / f'{task}_last.pt').resolve()
+    rflow_ckpt_path = (ckpt_dir / f'{task}_last.pt').resolve()
 
-    if resume and lfm_ckpt_path.exists():
+    if args.resume and rflow_ckpt_path.exists():
         try:
-            print('Resuming:\t', lfm_ckpt_path)
-            ckpt = torch.load(lfm_ckpt_path, map_location=device)
-            lfm.load_state_dict(ckpt['state_dict'])
+            print('Resuming:\t', rflow_ckpt_path)
+            ckpt = torch.load(rflow_ckpt_path, map_location=device)
+            rflow.load_state_dict(ckpt['state_dict'])
             optimizer.load_state_dict(ckpt['optimizer'])
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
@@ -165,6 +187,10 @@ def main():
             start_epoch = ckpt['epoch']
             val_loss = ckpt.get('val_loss', float('inf'))
 
+            # Explicitly delete the loaded checkpoint to free up system/GPU memory
+            del ckpt
+            torch.cuda.empty_cache()
+
             print('Epoch:\t', start_epoch)
             print('MSE:\t', val_loss)
             start_epoch += 1
@@ -172,7 +198,7 @@ def main():
             print(f'Load failed: {e}')
 
     suffix = datetime.now().strftime(f'{task}_%Y%m%d_%H%M%S')
-    if resume:
+    if args.resume:
         suffix += '_resume'
     log_dir = log_dir / suffix
     writer = SummaryWriter(log_dir=log_dir.as_posix())
@@ -211,14 +237,13 @@ def main():
                 progress=False,
             )
 
-        name = f'val_epoch_{ep:03d}_{name}.nii.gz'
-        saver(recon[0].cpu(), meta_data={'filename_or_obj': name})
+        saver(recon[0].cpu(), meta_data={'filename_or_obj': f'{name}.nii.gz'})
         return recon.cpu()
 
     amp_ctx = autocast(device.type) if use_amp else nullcontext()
 
     for epoch in range(start_epoch, num_epochs):
-        lfm.train()
+        rflow.train()
         epoch_loss = 0
         step = 0
 
@@ -227,14 +252,16 @@ def main():
         for batch in pbar:
             step += 1
 
-            # batch 现在是一个 dict，里面的 'image' 和 'condition' 是 List[Tensor]
+            # batch 现在是一个 dict，包含了 image, condition (List) 和 brand_id, size_id, numerics, masks (Tensor)
             image_list = batch['image']
             cond_list = batch['condition']
+            brand_id_batch = batch['brand_id'].to(device)
+            size_id_batch = batch['size_id'].to(device)
+            numerics_batch = batch['numerics'].to(device)
+            masks_batch = batch['masks'].to(device)
 
             current_bs = len(image_list)
-
-            # 累加这个 list 里所有的 loss
-            total_loss_for_this_batch = torch.tensor(0.0, device=device)
+            display_loss = 0.0
 
             with amp_ctx:
                 for b_idx in range(current_bs):
@@ -242,9 +269,25 @@ def main():
                     image = image_list[b_idx].unsqueeze(0).to(device, non_blocking=True)
                     cond = cond_list[b_idx].unsqueeze(0).to(device, non_blocking=True)
 
-                    # CFG Condition Dropout
-                    drop_mask = (torch.rand(1, 1, 1, 1, 1, device=device) < 0.15).float()
-                    cond = cond * (1.0 - drop_mask)
+                    brand_id = brand_id_batch[b_idx : b_idx + 1]
+                    size_id = size_id_batch[b_idx : b_idx + 1]
+                    numerics = numerics_batch[b_idx : b_idx + 1]
+                    masks = masks_batch[b_idx : b_idx + 1]
+
+                    # CFG 策略: 互斥的分支，避免全局丢弃和独立丢弃互相覆盖
+                    cfg_rand = torch.rand(1, device=device).item()
+                    
+                    if cfg_rand < 0.10:
+                        # 1. 10% 概率全局全部丢弃 (Image 和 Context 均无条件)
+                        cond = torch.zeros_like(cond)
+                        current_masks = torch.zeros_like(masks)
+                    else:
+                        # 2. 否则保留 Image，对 Context 进行独立随机丢弃 (每个 Token 5% 概率)
+                        ind_drop_mask = (torch.rand(1, 6, device=device) < 0.05).float()
+                        current_masks = masks * (1.0 - ind_drop_mask)
+
+                    # 生成全局条件 Embeddings [1, 6, C]
+                    context = context_embedder(brand_id, size_id, numerics, current_masks)
 
                     # 采样时间步
                     timesteps = scheduler.sample_timesteps(image)
@@ -255,11 +298,11 @@ def main():
                     # RFM 加噪过程
                     noisy_image = scheduler.add_noise(original_samples=image, noise=noise, timesteps=timesteps)
 
-                    # 拼接输入
+                    # 拼接输入 (Image + Pre-op Condition)
                     input_tensor = torch.cat([noisy_image, cond], dim=1)
 
-                    # 预测速度 (Velocity)
-                    velocity_pred = lfm(x=input_tensor, timesteps=timesteps)
+                    # 预测速度 (Velocity), 注入 Context
+                    velocity_pred = rflow(x=input_tensor, timesteps=timesteps, context=context)
 
                     # RFM 的目标是真实数据与噪声的差: target_velocity = image - noise
                     target_velocity = image - noise
@@ -267,34 +310,34 @@ def main():
                     # 计算这一个样本的损失
                     loss = torch.nn.functional.mse_loss(velocity_pred.float(), target_velocity.float())
 
-                    # 累加，除以 current_bs 相当于在 List 内部求了平均
-                    # 除以 gradient_accumulation_steps 是为了跨 step 累积
-                    total_loss_for_this_batch += loss / current_bs / gradient_accumulation_steps
 
-            # 反向传播 (把这个 List 里所有图的计算图一起 backward)
+                    # Micro-batching: 计算完单张图的 loss 立刻 backward 释放计算图
+                    micro_loss = loss / current_bs / gradient_accumulation_steps
+
+                    if use_amp:
+                        scaler.scale(micro_loss).backward()
+                    else:
+                        micro_loss.backward()
+
+                    display_loss += micro_loss.item() * gradient_accumulation_steps * current_bs
+
             if use_amp:
-                scaler.scale(total_loss_for_this_batch).backward()
-
                 if step % gradient_accumulation_steps == 0 or step == len(train_loader):
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(lfm.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(rflow.parameters(), 1.0)
                     scaler.step(optimizer)
                     scaler.update()
 
                     optimizer.zero_grad(set_to_none=True)
-                    ema.update(lfm)
+                    ema.update(rflow)
             else:
-                total_loss_for_this_batch.backward()
-
                 if step % gradient_accumulation_steps == 0 or step == len(train_loader):
-                    torch.nn.utils.clip_grad_norm_(lfm.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(rflow.parameters(), 1.0)
                     optimizer.step()
 
                     optimizer.zero_grad(set_to_none=True)
-                    ema.update(lfm)
+                    ema.update(rflow)
 
-            # 这里记录的是当前这一步的平均 MSE 损失，用于显示
-            display_loss = total_loss_for_this_batch.item() * gradient_accumulation_steps
             epoch_loss += display_loss
 
             if step % 1 == 0:
@@ -307,9 +350,9 @@ def main():
 
         # 验证与采样 (保持 BS=1，不需要改 collate_fn)
         if epoch % val_interval == 0:
-            lfm.eval()
-            ema.store(lfm)
-            ema.copy_to(lfm)
+            rflow.eval()
+            ema.store(rflow)
+            ema.copy_to(rflow)
 
             val_loss = 0
             val_steps = 0
@@ -319,13 +362,21 @@ def main():
                     image = batch['image'].to(device)
                     cond = batch['condition'].to(device)
 
+                    brand_id = batch['brand_id'].to(device)
+                    size_id = batch['size_id'].to(device)
+                    numerics = batch['numerics'].to(device)
+                    masks = batch['masks'].to(device)
+
+                    # 生成全局条件 Embeddings
+                    context = context_embedder(brand_id, size_id, numerics, masks)
+
                     timesteps = scheduler.sample_timesteps(image)
                     noise = torch.randn_like(image)
                     noisy_image = scheduler.add_noise(original_samples=image, noise=noise, timesteps=timesteps)
                     input_tensor = torch.cat([noisy_image, cond], dim=1)
 
                     with amp_ctx:
-                        velocity_pred = lfm(input_tensor, timesteps)
+                        velocity_pred = rflow(input_tensor, timesteps, context=context)
                         target_velocity = image - noise
                         loss = torch.nn.functional.mse_loss(velocity_pred.float(), target_velocity.float())
 
@@ -336,8 +387,7 @@ def main():
                     if prl == val_prl:
                         name = f'{prl}_{i}'
 
-                        num_inference_steps = 50
-                        scheduler.set_timesteps(num_inference_steps=num_inference_steps)
+                        scheduler.set_timesteps(num_inference_steps=50)
                         all_timesteps = scheduler.timesteps
                         all_next_timesteps = torch.cat((all_timesteps[1:], torch.tensor([0], dtype=all_timesteps.dtype, device=all_timesteps.device)))
 
@@ -352,9 +402,14 @@ def main():
                             cond_input = torch.cat([cond, uncond])
                             model_input = torch.cat([latent_input, cond_input], dim=1)
 
+                            # CFG for context: (Cond Context, Uncond Context)
+                            # Uncond Context is generated by passing zero masks
+                            uncond_context = context_embedder(brand_id, size_id, numerics, torch.zeros_like(masks))
+                            context_input = torch.cat([context, uncond_context])
+
                             with torch.no_grad():
                                 t_input = t[None].to(device).repeat(2)
-                                velocity_pred_batch = lfm(model_input, t_input)
+                                velocity_pred_batch = rflow(model_input, t_input, context=context_input)
 
                             velocity_cond, velocity_uncond = velocity_pred_batch.chunk(2)
                             velocity_pred = velocity_uncond + classifier_free_guidence * (velocity_cond - velocity_uncond)
@@ -403,14 +458,14 @@ def main():
                         writer.add_image(f'val/Diff_{i}', drr_diff_hstack, epoch, dataformats='HWC')
                         Image.fromarray(drr_diff_hstack).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_Diff.png')
 
-            ema.restore(lfm)
+            ema.restore(rflow)
             avg_val_loss = val_loss / val_steps
             writer.add_scalar('val/loss', avg_val_loss, epoch)
             print('Val Loss:\t', avg_val_loss)
 
             ckpt = {
                 'epoch': epoch,
-                'state_dict': lfm.state_dict(),
+                'state_dict': rflow.state_dict(),
                 'ema_state': ema.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'val_loss': avg_val_loss,
