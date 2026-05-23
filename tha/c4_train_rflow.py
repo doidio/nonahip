@@ -8,7 +8,7 @@ import numpy as np
 import tomlkit
 import torch
 from kernel import fast_drr
-from monai.data import DataLoader, Dataset
+from monai.data import DataLoader, Dataset, pad_list_data_collate
 from monai.inferers import sliding_window_inference
 from monai.transforms import Compose, SaveImage
 from PIL import Image
@@ -43,9 +43,9 @@ def main():
         batch_size,
         sw_batch_size,
         lr,
-        gradient_accumulation_steps,
+        effective_batch_size,
         ema_decay,
-        classifier_free_guidence,
+        classifier_free_guidance,
     ) = [
         cfg['train'][task][_]
         for _ in (
@@ -56,16 +56,14 @@ def main():
             'batch_size',
             'sw_batch_size',
             'lr',
-            'gradient_accumulation_steps',
+            'effective_batch_size',
             'ema_decay',
-            'classifier_free_guidence',
+            'classifier_free_guidance',
         )
     ]
 
-    # 既然每个 batch 处理多张图，梯度累积相应减少
-    gradient_accumulation_steps = max(1, gradient_accumulation_steps // batch_size)
     print('List Batch Size:\t', batch_size)
-    print('Grad Accu Steps:\t', gradient_accumulation_steps)
+    print('Effective Batch:\t', effective_batch_size)
 
     patch_size = list(cfg['train']['vae']['patch_size'])
 
@@ -90,6 +88,10 @@ def main():
             val_files.append(it)
         else:
             train_files.append(it)
+
+    train_files.sort(key=lambda x: x['prl'])
+    val_files.sort(key=lambda x: x['prl'])
+    test_files.sort(key=lambda x: x['prl'])
 
     val_prl = val_files[0]['prl'] if len(val_files) else None
 
@@ -143,15 +145,23 @@ def main():
     train_ds = Dataset(data=train_files, transform=transforms)
     val_ds = Dataset(data=val_files, transform=transforms)
 
-    # 训练 Loader 使用 custom_collate
+    # 动态 Volume 采样器
+    # 最小 Shape: [32, 32, 44] (体积: 50,688)
+    # 最大 Shape: [64, 88, 160] (体积最大达: 454,784)
+    # 平均 Shape: [39, 37, 121] (平均体积: 181,923)
+    # 中位数 Shape: [40, 36, 128] (中位数体积: 181,440)
+    reference_volume = 180000
+    max_volume = batch_size * reference_volume
+    batch_sampler = define.DynamicRandomVolumeSampler(train_ds, max_volume=max_volume, shuffle=True)
+
+    # 训练 Loader 使用 pad_list_data_collate 实现动态 Padding
     train_loader = DataLoader(
         train_ds,
-        batch_size=batch_size,
-        shuffle=True,
+        batch_sampler=batch_sampler,
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=True,
-        collate_fn=define.rflow_collate_fn,
+        collate_fn=pad_list_data_collate,
     )
     # 验证 Loader 保持 BS=1 即可
     val_loader = DataLoader(val_ds, batch_size=1, num_workers=num_workers)
@@ -159,11 +169,13 @@ def main():
     embed_dim = 256
     rflow = define.rflow_unet(context_embedding_size=embed_dim).to(device)
     context_embedder = define.ContextEmbedder(embed_dim=embed_dim).to(device)
-    ema = define.EMA(rflow, decay=ema_decay)
+    rflow_ema = define.EMA(rflow, decay=ema_decay)
+    context_ema = define.EMA(context_embedder, decay=ema_decay)
 
     scheduler = define.scheduler_rflow()
 
     optimizer = torch.optim.AdamW(list(rflow.parameters()) + list(context_embedder.parameters()), lr=lr, weight_decay=1e-5)
+
     scaler = GradScaler() if use_amp else None
 
     start_epoch = 0
@@ -173,13 +185,23 @@ def main():
         try:
             print('Resuming:\t', rflow_ckpt_path)
             ckpt = torch.load(rflow_ckpt_path, map_location=device)
-            rflow.load_state_dict(ckpt['state_dict'])
+            rflow.load_state_dict(ckpt['rflow_state'])
+
+            if 'context_state' in ckpt:
+                print('Loading ContextEmbedder...')
+                context_embedder.load_state_dict(ckpt['context_state'])
+
             optimizer.load_state_dict(ckpt['optimizer'])
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
+                if 'initial_lr' in param_group:
+                    param_group['initial_lr'] = lr
 
-            if 'ema_state' in ckpt:
-                ema.load_state_dict(ckpt['ema_state'])
+            if 'rflow_state_ema' in ckpt:
+                rflow_ema.load_state_dict(ckpt['rflow_state_ema'])
+
+            if 'context_state_ema' in ckpt:
+                context_ema.load_state_dict(ckpt['context_state_ema'])
 
             if use_amp and 'scaler' in ckpt:
                 scaler.load_state_dict(ckpt['scaler'])
@@ -225,25 +247,30 @@ def main():
             return vae_model.decode(inputs)
 
         with torch.no_grad():
-            recon = sliding_window_inference(
-                inputs=z,
-                roi_size=[p // define.vae_downsample for p in patch_size],
-                sw_batch_size=sw_batch_size,
-                predictor=decode_predictor,
-                overlap=0.25,
-                mode='gaussian',
-                device=device,
-                sw_device=device,
-                progress=False,
-            )
+            with torch.autocast(device_type=device.type, enabled=False):
+                recon = sliding_window_inference(
+                    inputs=z,
+                    roi_size=[p // define.vae_downsample for p in patch_size],
+                    sw_batch_size=sw_batch_size,
+                    predictor=decode_predictor,
+                    overlap=0.25,
+                    mode='gaussian',
+                    device=device,
+                    sw_device=device,
+                    progress=False,
+                )
 
         saver(recon[0].cpu(), meta_data={'filename_or_obj': f'{name}.nii.gz'})
         return recon.cpu()
 
     amp_ctx = autocast(device.type) if use_amp else nullcontext()
 
+    accumulated_samples = 0
+    optimizer.zero_grad(set_to_none=True)
+
     for epoch in range(start_epoch, num_epochs):
         rflow.train()
+        context_embedder.train()
         epoch_loss = 0
         step = 0
 
@@ -252,91 +279,103 @@ def main():
         for batch in pbar:
             step += 1
 
-            # batch 现在是一个 dict，包含了 image, condition (List) 和 brand_id, size_id, numerics, masks (Tensor)
-            image_list = batch['image']
-            cond_list = batch['condition']
-            brand_id_batch = batch['brand_id'].to(device)
-            size_id_batch = batch['size_id'].to(device)
-            numerics_batch = batch['numerics'].to(device)
-            masks_batch = batch['masks'].to(device)
+            # batch 经过 pad_list_data_collate，全部是 Tensor
+            image = batch['image'].to(device, non_blocking=True)
+            cond = batch['condition'].to(device, non_blocking=True)
+            valid_mask = batch['valid_mask'].to(device, non_blocking=True)
+            brand_id = batch['brand_id'].to(device, non_blocking=True)
+            size_id = batch['size_id'].to(device, non_blocking=True)
+            numerics = batch['numerics'].to(device, non_blocking=True)
+            masks = batch['masks'].to(device, non_blocking=True)
 
-            current_bs = len(image_list)
-            display_loss = 0.0
+            current_bs = image.shape[0]
 
             with amp_ctx:
-                for b_idx in range(current_bs):
-                    # 取出当前单张样本，增加 Batch 维度使其变成 [1, C, D, H, W]
-                    image = image_list[b_idx].unsqueeze(0).to(device, non_blocking=True)
-                    cond = cond_list[b_idx].unsqueeze(0).to(device, non_blocking=True)
+                # CFG 策略: 互斥的分支，支持 Batched
+                cfg_rand = torch.rand(current_bs, 1, device=device)
 
-                    brand_id = brand_id_batch[b_idx : b_idx + 1]
-                    size_id = size_id_batch[b_idx : b_idx + 1]
-                    numerics = numerics_batch[b_idx : b_idx + 1]
-                    masks = masks_batch[b_idx : b_idx + 1]
+                # 1. 10% 概率全局全部丢弃
+                global_drop_mask = (cfg_rand < 0.10).float()
 
-                    # CFG 策略: 互斥的分支，避免全局丢弃和独立丢弃互相覆盖
-                    cfg_rand = torch.rand(1, device=device).item()
-                    
-                    if cfg_rand < 0.10:
-                        # 1. 10% 概率全局全部丢弃 (Image 和 Context 均无条件)
-                        cond = torch.zeros_like(cond)
-                        current_masks = torch.zeros_like(masks)
-                    else:
-                        # 2. 否则保留 Image，对 Context 进行独立随机丢弃 (每个 Token 5% 概率)
-                        ind_drop_mask = (torch.rand(1, 6, device=device) < 0.05).float()
-                        current_masks = masks * (1.0 - ind_drop_mask)
+                # Image Cond: 运用 Global Drop
+                cond = cond * (1.0 - global_drop_mask.view(current_bs, 1, 1, 1, 1))
 
-                    # 生成全局条件 Embeddings [1, 6, C]
-                    context = context_embedder(brand_id, size_id, numerics, current_masks)
+                # Context Cond: 独立随机丢弃 (每个 Token 5% 概率)
+                ind_drop_mask = (torch.rand(current_bs, 6, device=device) < 0.05).float()
 
-                    # 采样时间步
-                    timesteps = scheduler.sample_timesteps(image)
+                # 联合 Mask: 如果 global drop 则为 0，否则应用独立 drop
+                current_masks = masks * (1.0 - global_drop_mask) * (1.0 - ind_drop_mask)
 
-                    # 生成噪声
-                    noise = torch.randn_like(image)
+                # 生成全局条件 Embeddings [B, 6, C]
+                context = context_embedder(brand_id, size_id, numerics, current_masks)
 
-                    # RFM 加噪过程
-                    noisy_image = scheduler.add_noise(original_samples=image, noise=noise, timesteps=timesteps)
+                # 采样时间步
+                timesteps = scheduler.sample_timesteps(image)
 
-                    # 拼接输入 (Image + Pre-op Condition)
-                    input_tensor = torch.cat([noisy_image, cond], dim=1)
+                # 生成噪声，并严格屏蔽 Padding 区域
+                noise = torch.randn_like(image) * valid_mask
 
-                    # 预测速度 (Velocity), 注入 Context
-                    velocity_pred = rflow(x=input_tensor, timesteps=timesteps, context=context)
+                # RFM 加噪过程
+                noisy_image = scheduler.add_noise(original_samples=image, noise=noise, timesteps=timesteps)
 
-                    # RFM 的目标是真实数据与噪声的差: target_velocity = image - noise
-                    target_velocity = image - noise
+                # 拼接输入 (Image + Pre-op Condition)
+                input_tensor = torch.cat([noisy_image, cond], dim=1)
 
-                    # 计算这一个样本的损失
-                    loss = torch.nn.functional.mse_loss(velocity_pred.float(), target_velocity.float())
+                # 预测速度 (Velocity), 注入 Context
+                velocity_pred = rflow(x=input_tensor, timesteps=timesteps, context=context)
 
+                # RFM 的目标是真实数据与噪声的差: target_velocity = image - noise
+                target_velocity = image - noise
 
-                    # Micro-batching: 计算完单张图的 loss 立刻 backward 释放计算图
-                    micro_loss = loss / current_bs / gradient_accumulation_steps
+                # 计算这一批次的有效体素 MSE (完美规避由于 Padding 导致的纯噪声区域 Loss 占比过高的问题)
+                # 保证每个样本对梯度的贡献完全平等，避免体积偏差
+                raw_mse = torch.nn.functional.mse_loss(velocity_pred.float(), target_velocity.float(), reduction='none')
+                mse_per_sample = (raw_mse * valid_mask).sum(dim=(1, 2, 3, 4)) / (raw_mse.shape[1] * valid_mask.sum(dim=(1, 2, 3, 4)) + 1e-8)
+                raw_mse = mse_per_sample.mean()
 
-                    if use_amp:
-                        scaler.scale(micro_loss).backward()
-                    else:
-                        micro_loss.backward()
+                # 记录原始 MSE 用于监控和打印
+                display_loss = raw_mse.item()
 
-                    display_loss += micro_loss.item() * gradient_accumulation_steps * current_bs
+                loss = raw_mse
 
-            if use_amp:
-                if step % gradient_accumulation_steps == 0 or step == len(train_loader):
+                # 动态梯度累积缩放 (根据当前真实 bs 与期望有效 bs 的比例缩放 loss)
+                micro_loss = loss * (current_bs / effective_batch_size)
+
+                if use_amp:
+                    scaler.scale(micro_loss).backward()
+                else:
+                    micro_loss.backward()
+
+            accumulated_samples += current_bs
+
+            if accumulated_samples >= effective_batch_size:
+                if use_amp:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(rflow.parameters(), 1.0)
+
+                # 修正动态 Batch 带来的梯度误差，使得最终步进的梯度严格等于 accumulated_samples 个样本的均值
+                scale_factor = effective_batch_size / accumulated_samples
+                for param in list(rflow.parameters()) + list(context_embedder.parameters()):
+                    if param.grad is not None:
+                        param.grad *= scale_factor
+
+                torch.nn.utils.clip_grad_norm_(list(rflow.parameters()) + list(context_embedder.parameters()), 1.0)
+
+                if use_amp:
+                    scale_before = scaler.get_scale()
                     scaler.step(optimizer)
                     scaler.update()
-
-                    optimizer.zero_grad(set_to_none=True)
-                    ema.update(rflow)
-            else:
-                if step % gradient_accumulation_steps == 0 or step == len(train_loader):
-                    torch.nn.utils.clip_grad_norm_(rflow.parameters(), 1.0)
+                    scale_after = scaler.get_scale()
+                    step_skipped = scale_before > scale_after
+                else:
                     optimizer.step()
+                    step_skipped = False
 
-                    optimizer.zero_grad(set_to_none=True)
-                    ema.update(rflow)
+                if not step_skipped:
+                    rflow_ema.update(rflow)
+                    context_ema.update(context_embedder)
+
+                optimizer.zero_grad(set_to_none=True)
+                accumulated_samples = 0
 
             epoch_loss += display_loss
 
@@ -351,8 +390,11 @@ def main():
         # 验证与采样 (保持 BS=1，不需要改 collate_fn)
         if epoch % val_interval == 0:
             rflow.eval()
-            ema.store(rflow)
-            ema.copy_to(rflow)
+            context_embedder.eval()
+            rflow_ema.store(rflow)
+            rflow_ema.copy_to(rflow)
+            context_ema.store(context_embedder)
+            context_ema.copy_to(context_embedder)
 
             val_loss = 0
             val_steps = 0
@@ -361,6 +403,7 @@ def main():
                 for i, batch in enumerate(val_bar := tqdm(val_loader, desc='Val')):
                     image = batch['image'].to(device)
                     cond = batch['condition'].to(device)
+                    valid_mask = batch['valid_mask'].to(device)
 
                     brand_id = batch['brand_id'].to(device)
                     size_id = batch['size_id'].to(device)
@@ -371,14 +414,18 @@ def main():
                     context = context_embedder(brand_id, size_id, numerics, masks)
 
                     timesteps = scheduler.sample_timesteps(image)
-                    noise = torch.randn_like(image)
+                    noise = torch.randn_like(image) * valid_mask
                     noisy_image = scheduler.add_noise(original_samples=image, noise=noise, timesteps=timesteps)
                     input_tensor = torch.cat([noisy_image, cond], dim=1)
 
                     with amp_ctx:
                         velocity_pred = rflow(input_tensor, timesteps, context=context)
                         target_velocity = image - noise
-                        loss = torch.nn.functional.mse_loss(velocity_pred.float(), target_velocity.float())
+
+                        # 验证同样使用 Valid Mask 防止 Padding 偏差
+                        loss = torch.nn.functional.mse_loss(velocity_pred.float(), target_velocity.float(), reduction='none')
+                        loss_per_sample = (loss * valid_mask).sum(dim=(1, 2, 3, 4)) / (loss.shape[1] * valid_mask.sum(dim=(1, 2, 3, 4)) + 1e-8)
+                        loss = loss_per_sample.mean()
 
                     val_loss += loss.item()
                     val_steps += 1
@@ -392,30 +439,35 @@ def main():
                         all_next_timesteps = torch.cat((all_timesteps[1:], torch.tensor([0], dtype=all_timesteps.dtype, device=all_timesteps.device)))
 
                         generator = torch.Generator(device=device).manual_seed(42)
-                        generated = torch.randn(image.shape, device=device, generator=generator)
+                        # 初始化噪声时严格应用 valid_mask，防止 padding 区域引入 OOD 噪声
+                        generated = torch.randn(image.shape, device=device, generator=generator) * valid_mask
+
+                        # Pre-compute constant inputs for generation loop to save overhead
+                        uncond = torch.zeros_like(cond)
+                        cond_input = torch.cat([cond, uncond])
+
+                        # CFG for context: (Cond Context, Uncond Context)
+                        uncond_context = context_embedder(brand_id, size_id, numerics, torch.zeros_like(masks))
+                        context_input = torch.cat([context, uncond_context])
 
                         for t, next_t in zip(all_timesteps, all_next_timesteps):
                             val_bar.set_postfix({'RFlow': t.item()})
 
                             latent_input = torch.cat([generated] * 2)
-                            uncond = torch.zeros_like(cond)
-                            cond_input = torch.cat([cond, uncond])
                             model_input = torch.cat([latent_input, cond_input], dim=1)
 
-                            # CFG for context: (Cond Context, Uncond Context)
-                            # Uncond Context is generated by passing zero masks
-                            uncond_context = context_embedder(brand_id, size_id, numerics, torch.zeros_like(masks))
-                            context_input = torch.cat([context, uncond_context])
-
-                            with torch.no_grad():
+                            with torch.no_grad(), amp_ctx:  # 使用 AMP 保护以减少显存占用并加速推理
                                 t_input = t[None].to(device).repeat(2)
                                 velocity_pred_batch = rflow(model_input, t_input, context=context_input)
 
                             velocity_cond, velocity_uncond = velocity_pred_batch.chunk(2)
-                            velocity_pred = velocity_uncond + classifier_free_guidence * (velocity_cond - velocity_uncond)
+                            velocity_pred = velocity_uncond + classifier_free_guidance * (velocity_cond - velocity_uncond)
 
                             with torch.no_grad():
                                 generated, _ = scheduler.step(velocity_pred, t, generated, next_t)
+                                generated = generated * valid_mask  # 步进后必须再次清零 Padding 区域
+
+                        val_bar.set_postfix({})
 
                         with amp_ctx:
                             vis_generated = decode(generated, f'{name}_val_epoch_{epoch:03d}_Gen', vae_image, image_sf, image_mean, epoch)
@@ -431,7 +483,7 @@ def main():
                             drrs = []
                             for c in range(vis_tensor.shape[1]):
                                 img = vis_tensor[0, c].numpy()
-                                drr = fast_drr(img + 1.0, axis, th=(0.0, 2.0), mode='mean')
+                                drr = fast_drr(img * 0.5 + 0.5, axis, th=(0.0, 1.0), mode='mean')
                                 drrs.append(np.flipud(drr.transpose(1, 0, 2)))
                             return np.hstack(drrs)
 
@@ -458,15 +510,18 @@ def main():
                         writer.add_image(f'val/Diff_{i}', drr_diff_hstack, epoch, dataformats='HWC')
                         Image.fromarray(drr_diff_hstack).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_Diff.png')
 
-            ema.restore(rflow)
+            rflow_ema.restore(rflow)
+            context_ema.restore(context_embedder)
             avg_val_loss = val_loss / val_steps
             writer.add_scalar('val/loss', avg_val_loss, epoch)
             print('Val Loss:\t', avg_val_loss)
 
             ckpt = {
                 'epoch': epoch,
-                'state_dict': rflow.state_dict(),
-                'ema_state': ema.state_dict(),
+                'rflow_state': rflow.state_dict(),
+                'rflow_state_ema': rflow_ema.state_dict(),
+                'context_state': context_embedder.state_dict(),
+                'context_state_ema': context_ema.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'val_loss': avg_val_loss,
             }
@@ -474,10 +529,6 @@ def main():
                 ckpt['scaler'] = scaler.state_dict()
 
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-            if epoch % 50 == 0:
-                torch.save(ckpt, ckpt_dir / f'{task}_{epoch:03d}.pt')
-                print(f'Model saved at epoch {epoch}!')
 
             torch.save(ckpt, ckpt_dir / f'{task}_last.pt')
 

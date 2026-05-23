@@ -20,7 +20,7 @@ def main():
     parser.add_argument('--config', required=True)
     parser.add_argument('--checkpoint', help='Path to RFlow checkpoint (default: rflow_last.pt)')
     parser.add_argument('--num_samples', type=int, default=0, help='Max samples to test (0 for all)')
-    parser.add_argument('--guidance', type=float, help='Override classifier_free_guidence from config')
+    parser.add_argument('--guidance', type=float, help='Override classifier_free_guidance from config')
     parser.add_argument('--steps_n', type=int, default=1, help='N-steps to compare against 50-steps')
     args = parser.parse_args()
 
@@ -90,7 +90,7 @@ def main():
     rflow.eval()
 
     scheduler = define.scheduler_rflow()
-    cfg_guidance = args.guidance if args.guidance is not None else cfg_rflow['classifier_free_guidence']
+    cfg_guidance = args.guidance if args.guidance is not None else cfg_rflow['classifier_free_guidance']
     print(f'Comparison: {args.steps_n}-Step vs 50-Step (Guidance={cfg_guidance})')
 
     # 5. Test Loop

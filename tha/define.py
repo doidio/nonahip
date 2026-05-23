@@ -17,6 +17,8 @@ from monai.transforms import (
     RandCropByPosNegLabeld,
     SpatialPadd,
 )
+from torch.utils.data import Sampler
+from tqdm import tqdm
 
 ct_min = -1024.0
 ct_bone_min = 150.0  # 用于归一化
@@ -109,7 +111,7 @@ def vae_val_transforms(patch_size, channels):
 
 
 class LoadLatentConditiond(MapTransform):
-    """读取 .npy 文件 latent 数据 [8, D, H, W] float16"""
+    """读取 .npy 文件 latent 数据 [12, D, H, W] float16"""
 
     def __init__(self, keys, allow_missing_keys=False):
         super().__init__(keys, allow_missing_keys)
@@ -127,6 +129,9 @@ class LoadLatentConditiond(MapTransform):
 
         d['condition'] = data_tensor[0:4]  # 术前
         d['image'] = data_tensor[4:12]  # 假体
+
+        # 记录图像真实的有效体素掩码 (用于后续屏蔽 Padding 区域的纯噪声 Loss)
+        d['valid_mask'] = torch.ones((1, *data_tensor.shape[1:]), dtype=torch.float32)
 
         return d
 
@@ -175,15 +180,15 @@ class PrepareContextd(MapTransform):
         size = spec[1] if len(spec) > 1 else ''
 
         brand_id = self.brand_to_id.get(brand, 0)
-        size_id = self.size_to_id.get(size, 0)
+        brand_mask = 1.0 if brand in self.brand_to_id else 0.0
 
-        brand_mask = 1.0 if brand else 0.0
-        size_mask = 1.0 if size else 0.0
+        size_id = self.size_to_id.get(size, 0)
+        size_mask = 1.0 if size in self.size_to_id else 0.0
 
         # Numerics: [cup_outer, head_outer, head_offset, liner_offset]
         # 使用 Min-Max 归一化到 [-1, 1] 范围，提高对极端条件的鲁棒性
         def min_max_scale(val, min_val, max_val):
-            if val is None:
+            if val is None or val == '':
                 return 0.0, 0.0
             # 线性映射 [min, max] -> [-1, 1]
             return 2.0 * (float(val) - min_val) / (max_val - min_val) - 1.0, 1.0
@@ -206,22 +211,73 @@ class PrepareContextd(MapTransform):
         d['numerics'] = torch.tensor(nums, dtype=torch.float32)
         d['masks'] = torch.tensor(masks, dtype=torch.float32)
 
+        d.pop('context', None)
+
         return d
 
 
-def rflow_collate_fn(batch):
-    """
-    Latent 尺寸不一致，ListBatch 策略比 Padding 到固定较大尺寸更好
-    list 虽然不是 GPU 并行，但节省了不必要的 Padding 背景计算，同时保留了随机尺寸的泛化能力
-    """
-    return {
-        'image': [item['image'] for item in batch],
-        'condition': [item['condition'] for item in batch],
-        'brand_id': torch.stack([item['brand_id'] for item in batch]),
-        'size_id': torch.stack([item['size_id'] for item in batch]),
-        'numerics': torch.stack([item['numerics'] for item in batch]),
-        'masks': torch.stack([item['masks'] for item in batch]),
-    }
+class DynamicRandomVolumeSampler(Sampler):
+    """动态 Batch 采样器，确保具有不同空间尺寸的医学影像在 Padding 后的 Batch 体积处于安全显存范围内，并保证跨 Batch 的随机性"""
+
+    def __init__(self, dataset, max_volume, shuffle=True):
+        self.dataset = dataset
+        self.max_volume = max_volume
+        self.shuffle = shuffle
+
+        self.shapes = []
+        print('Scanning latent shapes for dynamic batching...')
+        for item in tqdm(dataset.data, desc='Scan shapes'):
+            shape = np.load(item['image'], mmap_mode='r').shape
+            self.shapes.append(shape[1:])  # 提取 D, H, W
+
+    def _generate_batches(self):
+        indices = list(range(len(self.dataset)))
+
+        if self.shuffle:
+            # 引入体积噪声，保证每次 Epoch 排序有差异，实现真正的随机组合
+            noise = np.random.uniform(0.8, 1.2, size=len(indices))
+            sort_keys = [self.shapes[i][0] * self.shapes[i][1] * self.shapes[i][2] * noise[i] for i in indices]
+        else:
+            sort_keys = [self.shapes[i][0] * self.shapes[i][1] * self.shapes[i][2] for i in indices]
+
+        # 按照近似体积排序
+        sorted_indices = [x for _, x in sorted(zip(sort_keys, indices))]
+
+        batches = []
+        batch = []
+        max_d, max_h, max_w = 0, 0, 0
+
+        for idx in sorted_indices:
+            d, h, w = self.shapes[idx]
+            next_max_d = max(max_d, d)
+            next_max_h = max(max_h, h)
+            next_max_w = max(max_w, w)
+            predicted_volume = (len(batch) + 1) * next_max_d * next_max_h * next_max_w
+
+            if (predicted_volume > self.max_volume and len(batch) > 0) or len(batch) >= 36:
+                batches.append(batch)
+                batch = [idx]
+                max_d, max_h, max_w = d, h, w
+            else:
+                batch.append(idx)
+                max_d, max_h, max_w = next_max_d, next_max_h, next_max_w
+
+        if batch:
+            batches.append(batch)
+
+        if self.shuffle:
+            np.random.shuffle(batches)  # 最后打乱批次顺序
+
+        return batches
+
+    def __iter__(self):
+        self.batches = self._generate_batches()
+        return iter(self.batches)
+
+    def __len__(self):
+        if not hasattr(self, 'batches'):
+            self.batches = self._generate_batches()
+        return len(self.batches)
 
 
 def rflow_transforms(image_mean, image_sf, cond_mean, cond_sf):
@@ -284,10 +340,11 @@ def rflow_unet(context_embedding_size=256):
         in_channels=12,
         out_channels=8,
         num_res_blocks=(2, 2, 2),
-        channels=(64, 128, 256),
+        channels=(96, 192, 384),
         attention_levels=(False, False, True),  # 启用自注意力学习解剖方位关系
         norm_num_groups=32,
         with_conditioning=True,  # 启用交叉注意力注入全局条件
+        transformer_num_layers=2,
         cross_attention_dim=context_embedding_size,
         use_flash_attention=True,
     )
@@ -310,6 +367,7 @@ class EMA:
             if param.requires_grad:
                 self.shadow[name] = param.data.clone()
 
+    @torch.no_grad()
     def update(self, model):
         """在每个训练 step 后更新 EMA 权重"""
         for name, param in model.named_parameters():
@@ -317,12 +375,14 @@ class EMA:
                 assert name in self.shadow
                 self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
 
+    @torch.no_grad()
     def store(self, model):
         """暂存当前模型的真实权重 (验证前调用)"""
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.original[name] = param.data.clone()
 
+    @torch.no_grad()
     def copy_to(self, model):
         """将 EMA 权重应用到模型 (验证时调用)"""
         for name, param in model.named_parameters():
@@ -330,6 +390,7 @@ class EMA:
                 assert name in self.shadow
                 param.data.copy_(self.shadow[name])
 
+    @torch.no_grad()
     def restore(self, model):
         """恢复模型的真实权重 (验证后调用，继续训练)"""
         for name, param in model.named_parameters():

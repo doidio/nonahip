@@ -82,7 +82,7 @@ def main():
     all_timesteps = scheduler.timesteps
     all_next_timesteps = torch.cat((all_timesteps[1:], torch.tensor([0], dtype=all_timesteps.dtype, device=all_timesteps.device)))
 
-    cfg_scale = cfg['train']['lfm']['classifier_free_guidence']
+    cfg_scale = cfg['train']['lfm']['classifier_free_guidance']
 
     with torch.no_grad():
         for batch in tqdm(loader, desc='Generating Reflow Trajectories'):

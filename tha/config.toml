@@ -1,14 +1,19 @@
 [pairs]
 excluded = [
     "1088620_R",
+    "1093552_R",
     "1214871_R",
-    "2316554_R",
-    "2823294_R",
     "1244210_L",
     "1280269_R",
+    "1282227_L",
+    "2316554_R",
+    "2823294_R",
     "2073708_R",
     "2089118_L",
+    "2447132_R",
     "2618314_L",
+    "3099401_L",
+    "3099401_R",
     "3171181_L",
     "3225404_R",
     "3277846_R",
@@ -20,6 +25,7 @@ excluded = [
     "3831536_L",
     "3911059_R",
     "3914068_L",
+    "3942322_L",
     "3966908_L",
     "4016816_L",
     "4036096_L",
@@ -28,11 +34,8 @@ excluded = [
     "4101735_R",
     "4183260_L",
     "4319904_L",
-    "4515791_R",
-    "3099401_L",
-    "3099401_R",
-    "3942322_L",
     "4455888_L",
+    "4515791_R",
 ]
 
 [dataset]
@@ -65,12 +68,12 @@ resume = false
 num_workers = 8
 num_epochs = 1000
 val_interval = 1
-batch_size = 4
+batch_size = 12                # 随单卡显存变化，3D 扩散很需要大 Batch 的均值效应
+effective_batch_size = 12      # 不随显存变化，显存不足时退化到梯度累积
 sw_batch_size = 12
 lr = 0.0001
-gradient_accumulation_steps = 16
 ema_decay = 0.999
-classifier_free_guidence = 3.0
+classifier_free_guidance = 3.0
 
 [val]
 3239892_L = "Stryker Accolade TMZF"
