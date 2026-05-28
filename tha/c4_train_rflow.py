@@ -8,7 +8,7 @@ import numpy as np
 import tomlkit
 import torch
 from kernel import fast_drr
-from monai.data import DataLoader, Dataset, pad_list_data_collate
+from monai.data import DataLoader, Dataset
 from monai.inferers import sliding_window_inference
 from monai.transforms import Compose, SaveImage
 from PIL import Image
@@ -20,7 +20,11 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def main():
-    torch.backends.cudnn.benchmark = True
+    # 妥协与性能优化折中说明：
+    # 禁用 cudnn.benchmark 是为了避免动态尺寸输入时，cuDNN 频繁检测并重新编译 3D 卷积计算图带来的开销。
+    # 因为每个样本的 ROI 尺寸不一致，逐个读取训练时输入尺度在不断变化。
+    # 禁用后虽然失去了针对固定尺寸的极致优化，但能彻底根除由于尺寸切换产生的每步卡顿与重编译延迟。
+    torch.backends.cudnn.benchmark = False
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', required=True)
     parser.add_argument('--resume', default=False, action='store_true')
@@ -40,7 +44,6 @@ def main():
         num_workers,
         num_epochs,
         val_interval,
-        batch_size,
         sw_batch_size,
         lr,
         effective_batch_size,
@@ -53,7 +56,6 @@ def main():
             'num_workers',
             'num_epochs',
             'val_interval',
-            'batch_size',
             'sw_batch_size',
             'lr',
             'effective_batch_size',
@@ -62,7 +64,6 @@ def main():
         )
     ]
 
-    print('List Batch Size:\t', batch_size)
     print('Effective Batch:\t', effective_batch_size)
 
     patch_size = list(cfg['train']['vae']['patch_size'])
@@ -145,23 +146,20 @@ def main():
     train_ds = Dataset(data=train_files, transform=transforms)
     val_ds = Dataset(data=val_files, transform=transforms)
 
-    # 动态 Volume 采样器
-    # 最小 Shape: [32, 32, 44] (体积: 50,688)
-    # 最大 Shape: [64, 88, 160] (体积最大达: 454,784)
-    # 平均 Shape: [39, 37, 121] (平均体积: 181,923)
-    # 中位数 Shape: [40, 36, 128] (中位数体积: 181,440)
-    reference_volume = 180000
-    max_volume = batch_size * reference_volume
-    batch_sampler = define.DynamicRandomVolumeSampler(train_ds, max_volume=max_volume, shuffle=True)
-
-    # 训练 Loader 使用 pad_list_data_collate 实现动态 Padding
+    # 妥协与机制调整说明：
+    # 为了避免批次间的动态 Padding (导致背景噪声区占比较大以及引入人为边界伪影)，
+    # 我们将 batch_size 设为 1，逐个加载单样本进行训练。
+    # 由于每个样本单独加载，不再存在多样本拼 Batch 时的尺寸对齐需求，故完全取消了动态 Padding 整理函数 (collate_fn) 
+    # 和动态体积采样器 (batch_sampler)。
+    # 显存及优化稳定性方面，通过梯度累加 (每 effective_batch_size=12 次反向传播后执行一次优化器更新) 
+    # 依然能够实现宏观上的大 Batch 均值效应，确保训练的稳定性与收敛效果。
     train_loader = DataLoader(
         train_ds,
-        batch_sampler=batch_sampler,
+        batch_size=1,
+        shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=True,
-        collate_fn=pad_list_data_collate,
     )
     # 验证 Loader 保持 BS=1 即可
     val_loader = DataLoader(val_ds, batch_size=1, num_workers=num_workers)
@@ -282,7 +280,6 @@ def main():
             # batch 经过 pad_list_data_collate，全部是 Tensor
             image = batch['image'].to(device, non_blocking=True)
             cond = batch['condition'].to(device, non_blocking=True)
-            valid_mask = batch['valid_mask'].to(device, non_blocking=True)
             brand_id = batch['brand_id'].to(device, non_blocking=True)
             size_id = batch['size_id'].to(device, non_blocking=True)
             numerics = batch['numerics'].to(device, non_blocking=True)
@@ -312,8 +309,8 @@ def main():
                 # 采样时间步
                 timesteps = scheduler.sample_timesteps(image)
 
-                # 生成噪声，并严格屏蔽 Padding 区域
-                noise = torch.randn_like(image) * valid_mask
+                # 设计妥协说明：移除了 valid_mask。因为训练数据已在离线对齐 32 整数倍，且 batch_size = 1，无批次内 padding。
+                noise = torch.randn_like(image)
 
                 # RFM 加噪过程
                 noisy_image = scheduler.add_noise(original_samples=image, noise=noise, timesteps=timesteps)
@@ -327,11 +324,8 @@ def main():
                 # RFM 的目标是真实数据与噪声的差: target_velocity = image - noise
                 target_velocity = image - noise
 
-                # 计算这一批次的有效体素 MSE (完美规避由于 Padding 导致的纯噪声区域 Loss 占比过高的问题)
-                # 保证每个样本对梯度的贡献完全平等，避免体积偏差
-                raw_mse = torch.nn.functional.mse_loss(velocity_pred.float(), target_velocity.float(), reduction='none')
-                mse_per_sample = (raw_mse * valid_mask).sum(dim=(1, 2, 3, 4)) / (raw_mse.shape[1] * valid_mask.sum(dim=(1, 2, 3, 4)) + 1e-8)
-                raw_mse = mse_per_sample.mean()
+                # 设计妥协说明：移除了 valid_mask。由于每个 batch 大小恒为 1 且无 dynamic padding，直接计算均值 MSE 即可。
+                raw_mse = torch.nn.functional.mse_loss(velocity_pred.float(), target_velocity.float(), reduction='mean')
 
                 # 记录原始 MSE 用于监控和打印
                 display_loss = raw_mse.item()
@@ -403,7 +397,6 @@ def main():
                 for i, batch in enumerate(val_bar := tqdm(val_loader, desc='Val')):
                     image = batch['image'].to(device)
                     cond = batch['condition'].to(device)
-                    valid_mask = batch['valid_mask'].to(device)
 
                     brand_id = batch['brand_id'].to(device)
                     size_id = batch['size_id'].to(device)
@@ -414,7 +407,8 @@ def main():
                     context = context_embedder(brand_id, size_id, numerics, masks)
 
                     timesteps = scheduler.sample_timesteps(image)
-                    noise = torch.randn_like(image) * valid_mask
+                    # 设计妥协说明：验证亦移除 valid_mask
+                    noise = torch.randn_like(image)
                     noisy_image = scheduler.add_noise(original_samples=image, noise=noise, timesteps=timesteps)
                     input_tensor = torch.cat([noisy_image, cond], dim=1)
 
@@ -422,10 +416,8 @@ def main():
                         velocity_pred = rflow(input_tensor, timesteps, context=context)
                         target_velocity = image - noise
 
-                        # 验证同样使用 Valid Mask 防止 Padding 偏差
-                        loss = torch.nn.functional.mse_loss(velocity_pred.float(), target_velocity.float(), reduction='none')
-                        loss_per_sample = (loss * valid_mask).sum(dim=(1, 2, 3, 4)) / (loss.shape[1] * valid_mask.sum(dim=(1, 2, 3, 4)) + 1e-8)
-                        loss = loss_per_sample.mean()
+                        # 设计妥协说明：直接计算均值 MSE
+                        loss = torch.nn.functional.mse_loss(velocity_pred.float(), target_velocity.float(), reduction='mean')
 
                     val_loss += loss.item()
                     val_steps += 1
@@ -439,8 +431,8 @@ def main():
                         all_next_timesteps = torch.cat((all_timesteps[1:], torch.tensor([0], dtype=all_timesteps.dtype, device=all_timesteps.device)))
 
                         generator = torch.Generator(device=device).manual_seed(42)
-                        # 初始化噪声时严格应用 valid_mask，防止 padding 区域引入 OOD 噪声
-                        generated = torch.randn(image.shape, device=device, generator=generator) * valid_mask
+                        # 设计妥协说明：移除 valid_mask 遮罩
+                        generated = torch.randn(image.shape, device=device, generator=generator)
 
                         # Pre-compute constant inputs for generation loop to save overhead
                         uncond = torch.zeros_like(cond)
@@ -465,7 +457,7 @@ def main():
 
                             with torch.no_grad():
                                 generated, _ = scheduler.step(velocity_pred, t, generated, next_t)
-                                generated = generated * valid_mask  # 步进后必须再次清零 Padding 区域
+                                # 设计妥协说明：移除 valid_mask 的乘积清零操作
 
                         val_bar.set_postfix({})
 

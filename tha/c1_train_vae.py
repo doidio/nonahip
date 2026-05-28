@@ -232,12 +232,14 @@ def main():
 
             optimizer_g.zero_grad(set_to_none=True)
 
+            # 1. 强制在 FP32 下进行编码（避免 exp 溢出产生 Inf/NaN）
+            with autocast(device.type, enabled=False):
+                # 编码获取分布参数，注意 MONAI 源码实现返回的是 sigma 不是 log var
+                z_mu, z_sigma = vae.encode(images.float())
+
+            # 2. 重新开启 AMP，进行采样和解码
             amp_ctx = autocast(device.type) if use_amp else nullcontext()
             with amp_ctx:
-                # 编码获取分布参数，注意 MONAI 源码实现返回的是 sigma 不是 log var
-                z_mu, z_sigma = vae.encode(images)
-
-                # 解码
                 z = vae.sampling(z_mu, z_sigma)
                 reconstruction = vae.decode(z)
 
@@ -275,9 +277,10 @@ def main():
                     loss_g += per_loss
 
             with amp_ctx:
-                # KL 正则化损失
-                z_sigma_clamped = torch.clamp(z_sigma, min=1e-6, max=1e3)
-                kl_loss = 0.5 * torch.mean(z_mu.pow(2) + z_sigma_clamped.pow(2) - torch.log(z_sigma_clamped.pow(2)) - 1)
+                # KL 正则化损失 (转为 FP32 计算以确保数值稳定，并利用 MONAI 内部已有的 clamp 范围)
+                z_mu_f = z_mu.float()
+                z_sigma_f = z_sigma.float()
+                kl_loss = 0.5 * torch.mean(z_mu_f.pow(2) + z_sigma_f.pow(2) - torch.log(z_sigma_f.pow(2) + 1e-12) - 1)
 
                 if torch.isnan(kl_loss):
                     raise SystemExit('NaN in kl_loss')
@@ -312,14 +315,15 @@ def main():
                         eik_mask = (torch.abs(images) < 0.95).float()
 
                         if eik_mask.sum() > 0:
-                            eik_loss = torch.sum(eik_mask * (grad_norm - target_norm) ** 2) / (eik_mask.sum() + 1e-8)
+                            valid_eik_error = (grad_norm - target_norm)[eik_mask > 0]
+                            eik_loss = torch.mean(valid_eik_error**2)
                             loss_g += eik_loss * eik_weight
 
                         # 3. 内部实心度约束 (Solid Loss)
                         # 在预热后再开启，防止初期梯度过大导致崩溃
                         solid_mask = (images >= 1.0).float()
                         if solid_mask.sum() > 0:
-                            solid_loss = torch.sum(solid_mask * (reconstruction.float() - images.float()) ** 2) / (solid_mask.sum() + 1e-8)
+                            solid_loss = torch.mean(torch.relu(1.0 - reconstruction.float())[solid_mask > 0] ** 2)
                             loss_g += solid_loss * solid_weight
 
             if use_amp:
@@ -522,7 +526,7 @@ def main():
 
             ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-            if val_l1_loss < best_val_l1:  # 不用 PSNR 或 SSIM，L1 最能反映骨质宏观占位和均值偏移，同时也最能确保 TSDF 准确
+            if not warmup and val_l1_loss < best_val_l1:  # 不用 PSNR 或 SSIM，L1 最能反映骨质宏观占位和均值偏移，同时也最能确保 TSDF 准确
                 best_val_l1 = val_l1_loss
                 checkpoint['best_val_l1'] = best_val_l1
 

@@ -5,8 +5,262 @@ from pathlib import Path
 import numpy as np
 
 
+FEMORAL = {
+    '': [''],
+    'DePuy Corail': [
+        '',
+        '8 (标准无领)',
+        '9 (标准无领)',
+        '10 (标准无领)',
+        '11 (标准无领)',
+        '12 (标准无领)',
+        '13 (标准无领)',
+        '14 (标准无领)',
+        '15 (标准无领)',
+        '16 (标准无领)',
+        '18 (标准无领)',
+        '20 (标准无领)',
+        '8 (标准带领)',
+        '9 (标准带领)',
+        '10 (标准带领)',
+        '11 (标准带领)',
+        '12 (标准带领)',
+        '13 (标准带领)',
+        '14 (标准带领)',
+        '15 (标准带领)',
+        '16 (标准带领)',
+        '18 (标准带领)',
+        '20 (标准带领)',
+        '9 (高偏心无领)',
+        '10 (高偏心无领)',
+        '11 (高偏心无领)',
+        '12 (高偏心无领)',
+        '13 (高偏心无领)',
+        '14 (高偏心无领)',
+        '15 (高偏心无领)',
+        '16 (高偏心无领)',
+        '9 (内翻带领)',
+        '10 (内翻带领)',
+        '11 (内翻带领)',
+        '12 (内翻带领)',
+        '13 (内翻带领)',
+        '14 (内翻带领)',
+        '15 (内翻带领)',
+        '16 (内翻带领)',
+        '18 (内翻带领)',
+        '20 (内翻带领)',
+        '6 (DDH)',
+        '10 (翻修标准)',
+        '11 (翻修标准)',
+        '12 (翻修标准)',
+        '13 (翻修标准)',
+        '14 (翻修标准)',
+        '15 (翻修标准)',
+        '16 (翻修标准)',
+        '18 (翻修标准)',
+        '20 (翻修标准)',
+        '10 (翻修高偏心)',
+        '11 (翻修高偏心)',
+        '12 (翻修高偏心)',
+        '13 (翻修高偏心)',
+        '14 (翻修高偏心)',
+        '15 (翻修高偏心)',
+        '16 (翻修高偏心)',
+        '18 (翻修高偏心)',
+        '20 (翻修高偏心)',
+    ],
+    'DePuy Tri-Lock': ['', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'],
+    'DePuy SUMMIT': ['', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
+    'DePuy S-ROM': ['', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20'],
+    'Stryker Accolade TMZF': [
+        '',
+        '0 (127°)',
+        '1 (127°)',
+        '2 (127°)',
+        '2.5 (127°)',
+        '3 (127°)',
+        '3.5 (127°)',
+        '4 (127°)',
+        '4.5 (127°)',
+        '5 (127°)',
+        '5.5 (127°)',
+        '6 (127°)',
+        '7 (127°)',
+        '8 (127°)',
+        '0 (132°)',
+        '1 (132°)',
+        '2 (132°)',
+        '2.5 (132°)',
+        '3 (132°)',
+        '3.5 (132°)',
+        '4 (132°)',
+        '4.5 (132°)',
+        '5 (132°)',
+        '5.5 (132°)',
+        '6 (132°)',
+        '7 (132°)',
+        '8 (132°)',
+    ],
+    'Stryker Accolade II': [
+        '',
+        '0 (127°)',
+        '1 (127°)',
+        '2 (127°)',
+        '3 (127°)',
+        '4 (127°)',
+        '5 (127°)',
+        '6 (127°)',
+        '7 (127°)',
+        '8 (127°)',
+        '9 (127°)',
+        '10 (127°)',
+        '11 (127°)',
+        '0 (132°)',
+        '1 (132°)',
+        '2 (132°)',
+        '3 (132°)',
+        '4 (132°)',
+        '5 (132°)',
+        '6 (132°)',
+        '7 (132°)',
+        '8 (132°)',
+        '9 (132°)',
+        '10 (132°)',
+        '11 (132°)',
+    ],
+    'Stryker Secur-Fit': [
+        '',
+        '6 (127°)',
+        '7 (127°)',
+        '8 (127°)',
+        '9 (127°)',
+        '10 (127°)',
+        '11 (127°)',
+        '12 (127°)',
+        '13 (127°)',
+        '4 (132°)',
+        '5 (132°)',
+        '6 (132°)',
+        '7 (132°)',
+        '8 (132°)',
+        '9 (132°)',
+        '10 (132°)',
+        '11 (132°)',
+        '12 (132°)',
+        '13 (132°)',
+        '14 (132°)',
+    ],
+    'Wright Profemur': ['', '1', '2', '3', '4', '5', '6', '7', '8', '9'],
+    'Smith & Nephew Synergy': ['', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'],
+    'Smith & Nephew Anthology': ['', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'],
+    'Smith & Nephew Plus-TS': ['', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
+    'Zimmer M/L Taper': ['', '4', '5', '6', '7.5', '9', '10', '11', '12.5', '13.5', '15', '16.25', '17.5', '20', '22.5', 'ML'],
+    'Zimmer CLS Spotorno': ['', '5', '6', '7', '8', '9', '10', '11.25', '12.5', '13.75', '15', '16.25'],
+    'AK Medical ML-TP': ['', '1', '2', '2.5', '3', '3.5', '4', '5', '6'],
+    'Waldemar Link LCU': [
+        '',
+        '7',
+        '8',
+        '9',
+        '10',
+        '11',
+        '12',
+        '13',
+        '14',
+        '15',
+        '16',
+        '17',
+        '18',
+        '19',
+        '20',
+        '21',
+        '22',
+        '23',
+        '24',
+        '25',
+        '26',
+        '27',
+        '28',
+    ],
+    'Keyi Bangen SQKA': ['', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
+    'Zimmer CPT': ['', '0', '1', '2', '3', '4', '5', 'Long Size 2', 'Long Size 3', 'Long Size 4'],
+    'Zimmer Wagner SL': ['', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '24', '25', '26', '27', '28', '29', '30'],
+    'Wagner Cone': [
+        '',
+        '13 (125°)',
+        '14 (125°)',
+        '15 (125°)',
+        '16 (125°)',
+        '17 (125°)',
+        '18 (125°)',
+        '19 (125°)',
+        '20 (125°)',
+        '21 (125°)',
+        '22 (125°)',
+        '13 (135°)',
+        '14 (135°)',
+        '15 (135°)',
+        '16 (135°)',
+        '17 (135°)',
+        '18 (135°)',
+        '19 (135°)',
+        '20 (135°)',
+        '21 (135°)',
+        '22 (135°)',
+    ],
+}
+
+BRANDS = sorted(list(FEMORAL.keys()))
+SIZES = sorted(list({s for sizes in FEMORAL.values() for s in sizes}))
+
+
 def _printf(*args):
     print(*args)
+
+
+def parse_context(brands, sizes, stem_brand=None, stem_size=None, cup_outer=None, head_outer=None, head_offset=None, liner_offset=None):
+    import torch
+
+    brand_to_id = {b: i for i, b in enumerate(brands)}
+    size_to_id = {s: i for i, s in enumerate(sizes)}
+
+    brand_val = stem_brand if stem_brand is not None else ''
+    size_val = stem_size if stem_size is not None else ''
+
+    if size_val and not brand_val:
+        raise ValueError('Cannot specify stem_size without specifying stem_brand.')
+
+    if brand_val not in FEMORAL:
+        raise ValueError(f"Unknown stem_brand: '{brand_val}'. Supported brands are: {list(FEMORAL.keys())}")
+
+    if size_val not in FEMORAL[brand_val]:
+        raise ValueError(f"Unknown stem_size: '{size_val}' for brand '{brand_val}'. Supported sizes are: {FEMORAL[brand_val]}")
+
+    brand_id = brand_to_id.get(brand_val, 0)
+    brand_mask = 1.0 if brand_val in brand_to_id else 0.0
+
+    size_id = size_to_id.get(size_val, 0)
+    size_mask = 1.0 if size_val in size_to_id else 0.0
+
+    def min_max_scale(val, min_val, max_val):
+        if val is None or val == '':
+            return 0.0, 0.0
+        return 2.0 * (float(val) - min_val) / (max_val - min_val) - 1.0, 1.0
+
+    cup_outer_val, cup_outer_mask = min_max_scale(cup_outer, 38.0, 62.0)
+    head_outer_val, head_outer_mask = min_max_scale(head_outer, 22.0, 44.0)
+    head_offset_val, head_offset_mask = min_max_scale(head_offset, -5.0, 9.0)
+    liner_offset_val, liner_offset_mask = min_max_scale(liner_offset, 0.0, 6.0)
+
+    nums = [cup_outer_val, head_outer_val, head_offset_val, liner_offset_val]
+    masks = [brand_mask, size_mask, cup_outer_mask, head_outer_mask, head_offset_mask, liner_offset_mask]
+
+    return (
+        torch.tensor([brand_id], dtype=torch.long),
+        torch.tensor([size_id], dtype=torch.long),
+        torch.tensor([nums], dtype=torch.float32),
+        torch.tensor([masks], dtype=torch.float32),
+    )
 
 
 def diff_dmc(volume, origin, spacing, threshold):
@@ -32,6 +286,12 @@ def diff_dmc(volume, origin, spacing, threshold):
 def main(
     cond,
     save,
+    stem_brand=None,
+    stem_size=None,
+    cup_outer=None,
+    head_outer=None,
+    head_offset=None,
+    liner_offset=None,
     vae_pre=None,
     vae_metal=None,
     rflow=None,
@@ -62,6 +322,35 @@ def main(
     from monai.networks.schedulers import RFlowScheduler
     from monai.transforms import CenterSpatialCrop, Compose, DivisiblePadd, EnsureChannelFirstd, LoadImaged, SpatialPadd
     from torch import autocast
+
+    class ContextEmbedder(torch.nn.Module):
+        """将手术设计参数编码为全局条件向量序列 [B, 6, C]"""
+
+        def __init__(self, brands, sizes, embed_dim=256):
+            super().__init__()
+            self.brand_emb = torch.nn.Embedding(len(brands), embed_dim)
+            self.size_emb = torch.nn.Embedding(len(sizes), embed_dim)
+
+            self.cup_outer_proj = torch.nn.Linear(1, embed_dim)
+            self.head_outer_proj = torch.nn.Linear(1, embed_dim)
+            self.head_offset_proj = torch.nn.Linear(1, embed_dim)
+            self.liner_offset_proj = torch.nn.Linear(1, embed_dim)
+
+        def forward(self, brand_id, size_id, numerics, masks=None):
+            brand_embed = self.brand_emb(brand_id)  # [B, C]
+            size_embed = self.size_emb(size_id)  # [B, C]
+
+            cup_outer_embed = self.cup_outer_proj(numerics[:, 0:1])  # [B, C]
+            head_outer_embed = self.head_outer_proj(numerics[:, 1:2])  # [B, C]
+            head_offset_embed = self.head_offset_proj(numerics[:, 2:3])  # [B, C]
+            liner_offset_embed = self.liner_offset_proj(numerics[:, 3:4])  # [B, C]
+
+            out = torch.stack([brand_embed, size_embed, cup_outer_embed, head_outer_embed, head_offset_embed, liner_offset_embed], dim=1)
+
+            if masks is not None:
+                out = out * masks.unsqueeze(-1)
+
+            return out
 
     # 设备选择
     if cpu:
@@ -133,24 +422,42 @@ def main(
         in_channels=12,
         out_channels=8,
         num_res_blocks=(2, 2, 2),
-        channels=(64, 128, 256),
+        channels=(96, 192, 384),
         attention_levels=(False, False, True),
         norm_num_groups=32,
-        with_conditioning=False,
+        with_conditioning=True,
+        transformer_num_layers=2,
+        cross_attention_dim=256,
         use_flash_attention=not cpu,
     ).to(device)
+
+    context_embedder = ContextEmbedder(brands=BRANDS, sizes=SIZES, embed_dim=256).to(device)
 
     loaded = torch.load(rflow_path, map_location=device)
     printf('Epoch:\t {0}'.format(loaded['epoch']))
     printf('Param:\t {0:.2f} B'.format(sum(p.numel() for p in rflow_model.parameters()) / 1e9))
 
-    if 'ema_state' in loaded:
+    if 'rflow_state_ema' in loaded:
+        rflow_model.load_state_dict(loaded['rflow_state_ema'])
+        printf('Loaded RFlow EMA weights.')
+    elif 'rflow_state' in loaded:
+        rflow_model.load_state_dict(loaded['rflow_state'])
+    elif 'ema_state' in loaded:
         rflow_model.load_state_dict(loaded['ema_state'])
-        printf('Loaded EMA weights.')
+        printf('Loaded EMA weights (legacy).')
     else:
         rflow_model.load_state_dict(loaded['state_dict'])
 
+    if 'context_state_ema' in loaded:
+        context_embedder.load_state_dict(loaded['context_state_ema'])
+        printf('Loaded Context EMA weights.')
+    elif 'context_state' in loaded:
+        context_embedder.load_state_dict(loaded['context_state'])
+    else:
+        printf('Warning: No ContextEmbedder state found in checkpoint.')
+
     rflow_model.eval().float()
+    context_embedder.eval().float()
 
     # 初始化 RFlow 采样器
     scheduler = RFlowScheduler(num_train_timesteps=1000)
@@ -169,6 +476,17 @@ def main(
     cond_path = Path(cond)
     if not cond_path.exists():
         raise SystemError(f'Condition not found:\t {cond_path.resolve()}')
+
+    b_id, s_id, nums, msks = parse_context(BRANDS, SIZES, stem_brand, stem_size, cup_outer, head_outer, head_offset, liner_offset)
+    b_id = b_id.to(device)
+    s_id = s_id.to(device)
+    nums = nums.to(device)
+    msks = msks.to(device)
+    print(b_id, s_id, nums, msks)
+
+    with torch.no_grad():
+        context_emb = context_embedder(b_id, s_id, nums, msks)
+        uncond_context_emb = context_embedder(b_id, s_id, nums, torch.zeros_like(msks))
 
     # 准备后处理工具与原始尺寸
     import itk
@@ -284,7 +602,7 @@ def main(
                 # 2-RF Mode: Single pass
                 model_input = torch.cat([generated, cond_encoded], dim=1)
                 with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
-                    velocity_pred = rflow_model(model_input, t[None].to(device))
+                    velocity_pred = rflow_model(model_input, t[None].to(device), context=context_emb)
             else:
                 # 1-RF Mode or Multi-step: CFG logic
                 t_input = t[None].to(device).repeat(2)
@@ -292,21 +610,22 @@ def main(
                 if cfg_val > 1.0:
                     latent_input = torch.cat([generated] * 2, dim=0)
                     cond_input = torch.cat([cond_encoded, torch.zeros_like(cond_encoded)], dim=0)
+                    context_input = torch.cat([context_emb, uncond_context_emb], dim=0)
                     model_input = torch.cat([latent_input, cond_input], dim=1)
 
                     with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
-                        velocity_pred_batch = rflow_model(model_input, t_input)
+                        velocity_pred_batch = rflow_model(model_input, t_input, context=context_input)
 
                     velocity_cond, velocity_uncond = velocity_pred_batch.chunk(2)
                     velocity_pred = velocity_uncond + cfg_val * (velocity_cond - velocity_uncond)
                 elif cfg_val == 1.0:
                     model_input = torch.cat([generated, cond_encoded], dim=1)
                     with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
-                        velocity_pred = rflow_model(model_input, t[None].to(device))
+                        velocity_pred = rflow_model(model_input, t[None].to(device), context=context_emb)
                 else:
                     model_input = torch.cat([generated, torch.zeros_like(cond_encoded)], dim=1)
                     with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
-                        velocity_pred = rflow_model(model_input, t[None].to(device))
+                        velocity_pred = rflow_model(model_input, t[None].to(device), context=uncond_context_emb)
 
         # Euler 更新步 (x_next = x_t + dt * v_t)
         with torch.no_grad():
@@ -365,6 +684,13 @@ if __name__ == '__main__':
     parser.add_argument('--cond', type=str, required=True, help='术前条件图像路径 (.nii.gz)')
     parser.add_argument('--save', type=str, required=True, help='生成结果保存目录')
 
+    parser.add_argument('--stem-brand', type=str, default=None, help='股骨柄型号')
+    parser.add_argument('--stem-size', type=str, default=None, help='股骨柄规格')
+    parser.add_argument('--cup-outer', type=float, default=None, help='髋臼杯外径')
+    parser.add_argument('--head-outer', type=float, default=None, help='股骨头外径')
+    parser.add_argument('--head-offset', type=float, default=None, help='股骨头偏距')
+    parser.add_argument('--liner-offset', type=float, default=None, help='内衬偏心距')
+
     parser.add_argument('--vae-pre', type=str, default=None, help='VAE模型路径')
     parser.add_argument('--vae-metal', type=str, default=None, help='VAE模型路径')
     parser.add_argument('--rflow', type=str, default=None, help='RFlow模型路径')
@@ -383,6 +709,12 @@ if __name__ == '__main__':
         main(
             cond=args.cond,
             save=args.save,
+            stem_brand=args.stem_brand,
+            stem_size=args.stem_size,
+            cup_outer=args.cup_outer,
+            head_outer=args.head_outer,
+            head_offset=args.head_offset,
+            liner_offset=args.liner_offset,
             vae_pre=args.vae_pre,
             vae_metal=args.vae_metal,
             rflow=args.rflow,

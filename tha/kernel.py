@@ -263,9 +263,7 @@ def itk_threshold_largest(label, lower=1, upper=255):
         outside_value=0,
     )
     connected = itk.connected_component_image_filter(threshold)
-    largest = itk.label_shape_keep_n_objects_image_filter(
-        connected, background_value=0, number_of_objects=1, attribute='NumberOfPixels'
-    )
+    largest = itk.label_shape_keep_n_objects_image_filter(connected, background_value=0, number_of_objects=1, attribute='NumberOfPixels')
     out = itk.binary_threshold_image_filter(
         largest,
         lower_threshold=1,
@@ -369,17 +367,9 @@ def resample_roi(
     fem_uvw = wp.cw_div(fem_pos - post_origin, post_spacing)
     fem_pix = wp.volume_sample_f(post_volume, fem_uvw, wp.Volume.LINEAR)
 
-    hip_in = (
-        roi_hip_min[0] <= pos[0] <= roi_hip_max[0]
-        and roi_hip_min[1] <= pos[1] <= roi_hip_max[1]
-        and roi_hip_min[2] <= pos[2] <= roi_hip_max[2]
-    )
+    hip_in = roi_hip_min[0] <= pos[0] <= roi_hip_max[0] and roi_hip_min[1] <= pos[1] <= roi_hip_max[1] and roi_hip_min[2] <= pos[2] <= roi_hip_max[2]
 
-    fem_in = (
-        roi_fem_min[0] <= pos[0] <= roi_fem_max[0]
-        and roi_fem_min[1] <= pos[1] <= roi_fem_max[1]
-        and roi_fem_min[2] <= pos[2] <= roi_fem_max[2]
-    )
+    fem_in = roi_fem_min[0] <= pos[0] <= roi_fem_max[0] and roi_fem_min[1] <= pos[1] <= roi_fem_max[1] and roi_fem_min[2] <= pos[2] <= roi_fem_max[2]
 
     roi_images[i, j, k] = wp.vec3(bone_normalize(pix), bone_normalize(hip_pix), bone_normalize(fem_pix))
 
@@ -394,7 +384,8 @@ def resample_roi(
 
 @wp.kernel
 def resample_metal(
-    metal_image: wp.array3d(dtype=wp.vec3),
+    hip_image: wp.array3d(dtype=wp.float32),
+    fem_image: wp.array3d(dtype=wp.float32),
     roi_origin: wp.vec3,
     roi_spacing: wp.vec3,
     hip_mesh: wp.uint64,
@@ -413,45 +404,38 @@ def resample_metal(
     i, j, k = wp.tid()
 
     pos = roi_origin + wp.cw_mul(roi_spacing, wp.vec3(wp.float32(i), wp.float32(j), wp.float32(k)))
-    axis = wp.normalize(hip_cup_axis)
+    fem_cup_axis = wp.normalize(fem_cup_axis)
 
-    # 头球体
-    sdf_hip_head = head_radius - wp.length(pos - hip_head_center)
-    sdf_fem_head = head_radius - wp.length(pos - fem_head_center)
+    # 柄颈平面
+    hip_neck_plane = wp.dot(pos - hip_head_center, hip_cup_axis) - head_radius
+    fem_neck_plane = wp.dot(pos - fem_head_center, fem_cup_axis) - head_radius
 
-    # 杯心朝向1/2平面
-    sdf_cup_plane = wp.dot(pos - hip_cup_center, axis)
+    # 1. 髋臼侧假体组件（去柄）
+    query_hip = wp.mesh_query_point_sign_winding_number(hip_mesh, pos, max_dist)
+    if query_hip.result:
+        closest_hip = wp.mesh_eval_position(hip_mesh, query_hip.face, query_hip.u, query_hip.v)
+        d_hip = -query_hip.sign * wp.length(pos - closest_hip)
+    else:
+        d_hip = -sdf_t
 
-    # 柄颈朝向3/4平面
-    sdf_neck_plane = wp.dot(pos - fem_head_center, axis) - 0.5 * head_radius
-
-    # 1. 髋臼侧假体组件
-    # 半球壳 = 布尔交(杯球体, - 1/2杯心朝向, - 头球体)
-    d_cup = cup_radius - wp.length(pos - hip_cup_center)
-    sdf_cup = wp.min(wp.min(d_cup, -sdf_cup_plane), -sdf_hip_head)
+    sdf_cup = wp.min(d_hip, -hip_neck_plane)
 
     # 2. 股骨侧假体组件
-    # 去头柄 = 布尔交(柄实体, 3/4柄颈朝向, - 头球体)
-    query = wp.mesh_query_point_sign_normal(fem_mesh, pos, max_dist)
+    query = wp.mesh_query_point_sign_winding_number(fem_mesh, pos, max_dist)
     if query.result:
         closest = wp.mesh_eval_position(fem_mesh, query.face, query.u, query.v)
-        d_stem = -query.sign * wp.length(pos - closest)
+        d_fem = -query.sign * wp.length(pos - closest)
     else:
-        d_stem = -sdf_t
+        d_fem = -sdf_t
 
-    sdf_stem = wp.min(wp.min(d_stem, sdf_neck_plane), -sdf_fem_head)
+    sdf_stem = wp.min(d_fem, fem_neck_plane)
 
-    # 3. 零等值面融合
-    if sdf_cup > 0.0 or sdf_stem > 0.0:
-        merge = 2.0
-    else:
-        merge = -1.0
+    # 4. 移除了两侧的头球体融合，髋臼侧仅保留完美球壳 (sdf_cup)，股骨侧仅保留切除球头后的柄体 (sdf_stem)
+    hip_final = wp.clamp(sdf_cup / sdf_t, -1.0, 1.0)
+    fem_final = wp.clamp(sdf_stem / sdf_t, -1.0, 1.0)
 
-    # 4. 两侧分别融合头球体
-    hip_final = wp.clamp(wp.max(sdf_cup, sdf_hip_head) / sdf_t, -1.0, 1.0)
-    fem_final = wp.clamp(wp.max(sdf_stem, sdf_fem_head) / sdf_t, -1.0, 1.0)
-
-    metal_image[i, j, k] = wp.vec3(hip_final, fem_final, merge)
+    hip_image[i, j, k] = hip_final
+    fem_image[i, j, k] = fem_final
 
 
 @wp.kernel

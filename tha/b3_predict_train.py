@@ -14,19 +14,22 @@ from kernel import diff_dmc, fast_drr, resample_metal, resample_roi
 from PIL import Image
 from tqdm import tqdm
 
+core_size = 32
+
 
 def preload(cfg: dict, it: dict):
     prl = it['prl']
     pid, rl = prl.split('_')
 
-    root = Path(cfg['dataset']['root'])
+    dataset = Path(cfg['dataset']['root'])
+    train = Path(cfg['train']['root'])
     context, align = it['context'], it['align']
 
     # 读取数据
     ct_images, sizes, spacings, origins = [], [], [], []
 
     for op in ('pre', 'post'):
-        f = root / 'nii' / pid / it['pair'][op]
+        f = dataset / 'nii' / pid / it['pair'][op]
         if not f.exists():
             raise RuntimeError(f'Missing {op} data: {f}')
 
@@ -110,12 +113,10 @@ def preload(cfg: dict, it: dict):
     extents = roi_box[1] - roi_box[0]
 
     roi_size = np.ceil(extents / roi_spacing).astype(int) + [2, 2, 0]
-    # roi_size = np.ceil(roi_size / 16).astype(int) * 16
+    roi_size = np.ceil(roi_size / core_size).astype(int) * core_size
     max_dist = wp.float32(np.linalg.norm(roi_size * roi_spacing))  # type: ignore
-
     roi_origin = (roi_box[0] + roi_box[1]) * 0.5 - 0.5 * roi_spacing * roi_size
 
-    # 采样图像
     roi_images = wp.full((*roi_size,), wp.vec3(-1.0), dtype=wp.vec3)
     hip_metal = wp.full((*roi_size,), -1.0, wp.float32)
     femur_metal = wp.full((*roi_size,), -1.0, wp.float32)
@@ -150,7 +151,7 @@ def preload(cfg: dict, it: dict):
 
     # 重建假体
     meshes = []
-    for i, part in enumerate(('hip', 'femur')):
+    for i, part in enumerate(('cup', 'stem')):
         mesh = diff_dmc([hip_metal, femur_metal][i], roi_origin, roi_spacing, 0.0)
 
         if not mesh.is_empty:
@@ -172,17 +173,19 @@ def preload(cfg: dict, it: dict):
         else:
             raise RuntimeError(f'{part} metal is empty')
 
-        wp_mesh = wp.Mesh(wp.array(mesh.vertices, dtype=wp.vec3), wp.array(mesh.faces.flatten(), dtype=wp.int32))
+        wp_mesh = wp.Mesh(wp.array(mesh.vertices, dtype=wp.vec3), wp.array(mesh.faces.flatten(), dtype=wp.int32), support_winding_number=True)
         meshes.append(wp_mesh)
 
     # 采样假体
-    metal_image = wp.full((*roi_size,), wp.vec3(-1.0), wp.vec3)
+    hip_image = wp.full((*roi_size,), -1.0, wp.float32)
+    femur_image = wp.full((*roi_size,), -1.0, wp.float32)
 
     wp.launch(
         resample_metal,
         (*roi_size,),
         [
-            metal_image,
+            hip_image,
+            femur_image,
             roi_origin,
             wp.vec3(roi_spacing),
             meshes[0].id,
@@ -200,16 +203,25 @@ def preload(cfg: dict, it: dict):
         ],
     )
 
-    metal_image = metal_image.numpy()
+    for f, image in (
+        (train / 'dataset' / 'metal' / f'{prl}_cup.stl', hip_image),
+        (train / 'dataset' / 'metal' / f'{prl}_stem.stl', femur_image),
+    ):
+        f.parent.mkdir(parents=True, exist_ok=True)
+
+        mesh = diff_dmc(image, roi_origin, roi_spacing, 0.0)
+        mesh.export(f)
+
+    hip_image = hip_image.numpy()
+    femur_image = femur_image.numpy()
 
     # 存档
-    train = Path(cfg['train']['root']) / 'dataset'
     for f, image in (
-        (train / 'pre' / f'{prl}.nii.gz', pre_image),
-        (train / 'post_align_hip' / f'{prl}.nii.gz', post_images[0]),
-        (train / 'post_align_femur' / f'{prl}.nii.gz', post_images[1]),
-        (train / 'metal' / f'{prl}_cup.nii.gz', metal_image[..., 0]),
-        (train / 'metal' / f'{prl}_stem.nii.gz', metal_image[..., 1]),
+        (train / 'dataset' / 'pre' / f'{prl}.nii.gz', pre_image),
+        (train / 'dataset' / 'post_align_hip' / f'{prl}.nii.gz', post_images[0]),
+        (train / 'dataset' / 'post_align_femur' / f'{prl}.nii.gz', post_images[1]),
+        (train / 'dataset' / 'metal' / f'{prl}_cup.nii.gz', hip_image),
+        (train / 'dataset' / 'metal' / f'{prl}_stem.nii.gz', femur_image),
     ):
         f.parent.mkdir(parents=True, exist_ok=True)
 
@@ -223,25 +235,19 @@ def preload(cfg: dict, it: dict):
         itk.imwrite(image_itk, f.as_posix())
 
     # 快照
-    metal_images = [metal_image[..., _].copy() for _ in (0, 1)]
-    fusion_image = metal_image[..., 2].copy()
-
-    mask = metal_image[..., 2] <= -1.0  # 融合术前和假体
-    metal_image[..., 2][mask] = pre_image[mask]
-
     stack = []
     axis = 1  # 冠状面投影
-    for image in (pre_image, *post_images, fusion_image, *metal_images):
+    for image in (pre_image, *post_images, hip_image, femur_image):
         img = fast_drr(image + 1.0, axis, th=(0.0, 2.0), mode='mean')
         # 转置并翻转，确保解剖方位正确（Superior 在上）
         img = np.flipud(img.transpose(1, 0, 2))
         stack.append(img)
 
-    f = root / 'predict_train' / 'png' / f'{prl}.png'
+    f = train / 'dataset' / 'png' / f'{prl}.png'
     f.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(np.hstack(stack)).save(f)
 
-    return roi_origin, roi_spacing, [pre_image, *post_images, fusion_image, *metal_images]
+    return roi_origin, roi_spacing, [pre_image, *post_images, hip_image, femur_image]
 
 
 def submit(cfg: dict, it: dict, *args):

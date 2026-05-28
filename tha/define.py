@@ -9,7 +9,6 @@ from monai.networks.schedulers import RFlowScheduler
 from monai.transforms import (
     CopyItemsd,
     DeleteItemsd,
-    DivisiblePadd,
     EnsureChannelFirstd,
     Lambdad,
     LoadImaged,
@@ -17,8 +16,6 @@ from monai.transforms import (
     RandCropByPosNegLabeld,
     SpatialPadd,
 )
-from torch.utils.data import Sampler
-from tqdm import tqdm
 
 ct_min = -1024.0
 ct_bone_min = 150.0  # 用于归一化
@@ -82,11 +79,16 @@ def _foreground_fn(x):
 
 
 def vae_train_transforms(patch_size, channels):
+    # 设计妥协说明：
+    # 离线数据生成已将 ROI 大小对齐填充为 32 的整数倍。
+    # 当前 VAE (下采样4倍) 与 RFlow UNet (下采样4倍) 组合要求最小倍数为 16。
+    # 此处使用固定对齐因子 32 可以为以后微调网络参数（如增加下采样深度）预留足够的兼容余量，
+    # 避免由于网络架构调整而频繁重新生成庞大的离线训练数据。
+    # 此外，因为数据源和 patch_size（128）已天生是 32 的倍数，此处不再需要运行时的 DivisiblePadd。
     return [
         LoadImaged(keys=['image'], reader='ITKReader'),
         EnsureChannelFirstd(keys=['image'], channel_dim=-1 if channels > 1 else 'no_channel'),
         SpatialPadd(keys=['image'], spatial_size=patch_size, constant_values=-1.0),
-        DivisiblePadd(keys=['image'], k=16, constant_values=-1.0),
         CopyItemsd(keys=['image'], times=1, names=['label']),
         Lambdad(keys=['label'], func=_foreground_fn),
         RandCropByPosNegLabeld(
@@ -102,11 +104,11 @@ def vae_train_transforms(patch_size, channels):
 
 
 def vae_val_transforms(patch_size, channels):
+    # 设计妥协说明同上。数据源已离线对齐 32 倍数，故运行时无需 DivisiblePadd 逻辑。
     return [
         LoadImaged(keys=['image'], reader='ITKReader'),
         EnsureChannelFirstd(keys=['image'], channel_dim=-1 if channels > 1 else 'no_channel'),
         SpatialPadd(keys=['image'], spatial_size=patch_size, constant_values=-1.0),
-        DivisiblePadd(keys=['image'], k=16, constant_values=-1.0),
     ]
 
 
@@ -129,9 +131,6 @@ class LoadLatentConditiond(MapTransform):
 
         d['condition'] = data_tensor[0:4]  # 术前
         d['image'] = data_tensor[4:12]  # 假体
-
-        # 记录图像真实的有效体素掩码 (用于后续屏蔽 Padding 区域的纯噪声 Loss)
-        d['valid_mask'] = torch.ones((1, *data_tensor.shape[1:]), dtype=torch.float32)
 
         return d
 
@@ -214,70 +213,6 @@ class PrepareContextd(MapTransform):
         d.pop('context', None)
 
         return d
-
-
-class DynamicRandomVolumeSampler(Sampler):
-    """动态 Batch 采样器，确保具有不同空间尺寸的医学影像在 Padding 后的 Batch 体积处于安全显存范围内，并保证跨 Batch 的随机性"""
-
-    def __init__(self, dataset, max_volume, shuffle=True):
-        self.dataset = dataset
-        self.max_volume = max_volume
-        self.shuffle = shuffle
-
-        self.shapes = []
-        print('Scanning latent shapes for dynamic batching...')
-        for item in tqdm(dataset.data, desc='Scan shapes'):
-            shape = np.load(item['image'], mmap_mode='r').shape
-            self.shapes.append(shape[1:])  # 提取 D, H, W
-
-    def _generate_batches(self):
-        indices = list(range(len(self.dataset)))
-
-        if self.shuffle:
-            # 引入体积噪声，保证每次 Epoch 排序有差异，实现真正的随机组合
-            noise = np.random.uniform(0.8, 1.2, size=len(indices))
-            sort_keys = [self.shapes[i][0] * self.shapes[i][1] * self.shapes[i][2] * noise[i] for i in indices]
-        else:
-            sort_keys = [self.shapes[i][0] * self.shapes[i][1] * self.shapes[i][2] for i in indices]
-
-        # 按照近似体积排序
-        sorted_indices = [x for _, x in sorted(zip(sort_keys, indices))]
-
-        batches = []
-        batch = []
-        max_d, max_h, max_w = 0, 0, 0
-
-        for idx in sorted_indices:
-            d, h, w = self.shapes[idx]
-            next_max_d = max(max_d, d)
-            next_max_h = max(max_h, h)
-            next_max_w = max(max_w, w)
-            predicted_volume = (len(batch) + 1) * next_max_d * next_max_h * next_max_w
-
-            if (predicted_volume > self.max_volume and len(batch) > 0) or len(batch) >= 36:
-                batches.append(batch)
-                batch = [idx]
-                max_d, max_h, max_w = d, h, w
-            else:
-                batch.append(idx)
-                max_d, max_h, max_w = next_max_d, next_max_h, next_max_w
-
-        if batch:
-            batches.append(batch)
-
-        if self.shuffle:
-            np.random.shuffle(batches)  # 最后打乱批次顺序
-
-        return batches
-
-    def __iter__(self):
-        self.batches = self._generate_batches()
-        return iter(self.batches)
-
-    def __len__(self):
-        if not hasattr(self, 'batches'):
-            self.batches = self._generate_batches()
-        return len(self.batches)
 
 
 def rflow_transforms(image_mean, image_sf, cond_mean, cond_sf):
