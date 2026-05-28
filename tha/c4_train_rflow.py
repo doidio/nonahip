@@ -149,9 +149,9 @@ def main():
     # 妥协与机制调整说明：
     # 为了避免批次间的动态 Padding (导致背景噪声区占比较大以及引入人为边界伪影)，
     # 我们将 batch_size 设为 1，逐个加载单样本进行训练。
-    # 由于每个样本单独加载，不再存在多样本拼 Batch 时的尺寸对齐需求，故完全取消了动态 Padding 整理函数 (collate_fn) 
+    # 由于每个样本单独加载，不再存在多样本拼 Batch 时的尺寸对齐需求，故完全取消了动态 Padding 整理函数 (collate_fn)
     # 和动态体积采样器 (batch_sampler)。
-    # 显存及优化稳定性方面，通过梯度累加 (每 effective_batch_size=12 次反向传播后执行一次优化器更新) 
+    # 显存及优化稳定性方面，通过梯度累加 (每 effective_batch_size=12 次反向传播后执行一次优化器更新)
     # 依然能够实现宏观上的大 Batch 均值效应，确保训练的稳定性与收敛效果。
     train_loader = DataLoader(
         train_ds,
@@ -266,6 +266,38 @@ def main():
     accumulated_samples = 0
     optimizer.zero_grad(set_to_none=True)
 
+    def optimizer_step(accumulated_count):
+        if accumulated_count <= 0:
+            return
+
+        if use_amp:
+            scaler.unscale_(optimizer)
+
+        # Losses are scaled by effective_batch_size during accumulation; rescale
+        # the tail step so a partial final micro-batch still becomes a true mean.
+        tail_scale = effective_batch_size / accumulated_count
+        for param in list(rflow.parameters()) + list(context_embedder.parameters()):
+            if param.grad is not None:
+                param.grad *= tail_scale
+
+        torch.nn.utils.clip_grad_norm_(list(rflow.parameters()) + list(context_embedder.parameters()), 1.0)
+
+        if use_amp:
+            scale_before = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            scale_after = scaler.get_scale()
+            step_skipped = scale_before > scale_after
+        else:
+            optimizer.step()
+            step_skipped = False
+
+        if not step_skipped:
+            rflow_ema.update(rflow)
+            context_ema.update(context_embedder)
+
+        optimizer.zero_grad(set_to_none=True)
+
     for epoch in range(start_epoch, num_epochs):
         rflow.train()
         context_embedder.train()
@@ -343,32 +375,7 @@ def main():
             accumulated_samples += current_bs
 
             if accumulated_samples >= effective_batch_size:
-                if use_amp:
-                    scaler.unscale_(optimizer)
-
-                # 修正动态 Batch 带来的梯度误差，使得最终步进的梯度严格等于 accumulated_samples 个样本的均值
-                scale_factor = effective_batch_size / accumulated_samples
-                for param in list(rflow.parameters()) + list(context_embedder.parameters()):
-                    if param.grad is not None:
-                        param.grad *= scale_factor
-
-                torch.nn.utils.clip_grad_norm_(list(rflow.parameters()) + list(context_embedder.parameters()), 1.0)
-
-                if use_amp:
-                    scale_before = scaler.get_scale()
-                    scaler.step(optimizer)
-                    scaler.update()
-                    scale_after = scaler.get_scale()
-                    step_skipped = scale_before > scale_after
-                else:
-                    optimizer.step()
-                    step_skipped = False
-
-                if not step_skipped:
-                    rflow_ema.update(rflow)
-                    context_ema.update(context_embedder)
-
-                optimizer.zero_grad(set_to_none=True)
+                optimizer_step(accumulated_samples)
                 accumulated_samples = 0
 
             epoch_loss += display_loss
@@ -378,6 +385,11 @@ def main():
                 writer.add_scalar('train/loss', display_loss, global_step)
 
             pbar.set_postfix({'MSE': f'{display_loss:.4f}'})
+
+        # Flush the final partial accumulation before validation/checkpointing.
+        if accumulated_samples > 0:
+            optimizer_step(accumulated_samples)
+            accumulated_samples = 0
 
         writer.add_scalar('train/epoch_loss', epoch_loss / step, epoch)
 
@@ -475,7 +487,7 @@ def main():
                             drrs = []
                             for c in range(vis_tensor.shape[1]):
                                 img = vis_tensor[0, c].numpy()
-                                drr = fast_drr(img * 0.5 + 0.5, axis, th=(0.0, 1.0), mode='mean')
+                                drr = fast_drr(img + 1.0, axis, th=(0.1, 2.0), mode='mean')
                                 drrs.append(np.flipud(drr.transpose(1, 0, 2)))
                             return np.hstack(drrs)
 
@@ -495,7 +507,7 @@ def main():
                         diff_drrs = []
                         for c in range(vis_generated.shape[1]):
                             diff = np.abs(vis_generated[0, c].numpy() - vis_gt[0, c].numpy())
-                            drr_diff = fast_drr(diff, axis, th=(0.0, 1.0), mode='mean')
+                            drr_diff = fast_drr(diff + 1.0, axis, th=(0.1, 2.0), mode='mean')
                             diff_drrs.append(np.flipud(drr_diff.transpose(1, 0, 2)))
 
                         drr_diff_hstack = np.hstack(diff_drrs)
