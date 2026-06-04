@@ -4,7 +4,6 @@ from pathlib import Path
 
 import numpy as np
 
-
 FEMORAL = {
     '': [''],
     'DePuy Corail': [
@@ -402,9 +401,9 @@ def main(
         vae.eval().float()
         printf('Param:\t {0:.2f} B'.format(sum(p.numel() for p in vae.parameters()) / 1e9))
 
-        vae_dual += [vae, sf, mean]
+        vae_dual += [vae, sf, mean, channels]
 
-    vae_image, vae_image_scale, vae_image_mean, vae_cond, vae_cond_scale, vae_cond_mean = vae_dual
+    vae_image, vae_image_scale, vae_image_mean, vae_image_channels, vae_cond, vae_cond_scale, vae_cond_mean, vae_cond_channels = vae_dual
 
     # 加载 RFlow 模型 (DiffusionModelUNet)
     if rflow is None:
@@ -482,7 +481,6 @@ def main(
     s_id = s_id.to(device)
     nums = nums.to(device)
     msks = msks.to(device)
-    print(b_id, s_id, nums, msks)
 
     with torch.no_grad():
         context_emb = context_embedder(b_id, s_id, nums, msks)
@@ -501,7 +499,7 @@ def main(
     # MONAI ITKReader loads in (C, X, Y, Z) order
     cond_transforms = Compose([
         LoadImaged(keys=['image'], reader='ITKReader'),
-        EnsureChannelFirstd(keys=['image']),
+        EnsureChannelFirstd(keys=['image'], channel_dim=-1 if vae_cond_channels > 1 else 'no_channel'),
         SpatialPadd(keys=['image'], spatial_size=(128, 128, 128), constant_values=-1.0),
         DivisiblePadd(keys=['image'], k=16, constant_values=-1.0),
     ])
@@ -659,18 +657,25 @@ def main(
     # 保存最终的结果
     # 方案 A: 保存为 4D 图像
     save_metal = save_dir / cond_path.name.replace('.nii.gz', '_metal.nii.gz')
-    itk_metal = itk.image_from_array(generated_np.transpose(3, 0, 1, 2), is_vector=False)
+    itk_metal = itk.image_from_array(np.ascontiguousarray(generated_np.transpose(3, 0, 1, 2)), is_vector=False)
     itk_metal.SetSpacing(list(itk_img.GetSpacing()) + [1.0])
     itk_metal.SetOrigin(list(itk_img.GetOrigin()) + [0.0])
+
+    # 构造 4x4 旋转矩阵以保留原图的物理朝向
+    dir_3x3 = itk.GetArrayFromMatrix(itk_img.GetDirection())
+    dir_4x4 = np.eye(4)
+    dir_4x4[:3, :3] = dir_3x3
+    itk_metal.SetDirection(itk.GetMatrixFromArray(dir_4x4))
+
     itk.imwrite(itk_metal, save_metal.as_posix())
 
     # 方案 B: 保存为独立文件
     for i, name_suffix in enumerate(['_cup', '_stem']):
         chan_path = save_dir / cond_path.name.replace('.nii.gz', f'{name_suffix}.nii.gz')
-        itk_chan = itk.image_from_array(generated_np[..., i])
-        itk_chan.SetSpacing(itk_img.GetSpacing())
-        itk_chan.SetOrigin(itk_img.GetOrigin())
-        itk_chan.SetDirection(itk_img.GetDirection())
+        itk_chan = itk.image_from_array(np.ascontiguousarray(generated_np[..., i]))
+        itk_chan.SetSpacing(list(itk_img.GetSpacing())[:3])
+        itk_chan.SetOrigin(list(itk_img.GetOrigin())[:3])
+        itk_chan.SetDirection(itk.GetMatrixFromArray(dir_3x3))
         itk.imwrite(itk_chan, chan_path.as_posix())
 
     printf('Post-process:\t {0:.2f}s'.format(time.time() - start_dec))
@@ -700,7 +705,7 @@ if __name__ == '__main__':
     parser.add_argument('--sw', type=int, default=4, help='滑动窗口推理时的并行 Batch Size')
 
     parser.add_argument('--seed', type=int, default=None, help='随机种子')
-    parser.add_argument('--cfg', type=float, default=3.0, help='Guidance 权重')
+    parser.add_argument('--cfg', type=float, default=1.0, help='Guidance 权重')
     parser.add_argument('--ts', type=int, default=5, help='采样步数')
 
     args = parser.parse_args()

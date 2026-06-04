@@ -5,6 +5,7 @@ from pathlib import Path
 
 import itk
 import numpy as np
+import scipy.ndimage as ndimage
 import tomlkit
 import trimesh
 import warp as wp
@@ -149,24 +150,48 @@ def preload(cfg: dict, it: dict):
     roi_images = roi_images.numpy()
     pre_image, post_images = roi_images[..., 0], [roi_images[..., 1], roi_images[..., 2]]
 
+    # 形态学闭合补洞，填充球头内部伪影变暗导致的伪空腔
+    def fill_metal_voids(metal_sdf, iters=2):
+        mask = metal_sdf > 0
+        mask = ndimage.binary_closing(mask, iterations=iters)
+        mask = ndimage.binary_fill_holes(mask)
+        metal_sdf[mask & (metal_sdf <= 0)] = 1.0
+        return metal_sdf
+
+    hip_metal_np = fill_metal_voids(hip_metal.numpy())
+    femur_metal_np = fill_metal_voids(femur_metal.numpy())
+
+    hip_metal = wp.array(hip_metal_np, dtype=wp.float32)
+    femur_metal = wp.array(femur_metal_np, dtype=wp.float32)
+
     # 重建假体
     meshes = []
     for i, part in enumerate(('cup', 'stem')):
         mesh = diff_dmc([hip_metal, femur_metal][i], roi_origin, roi_spacing, 0.0)
 
         if not mesh.is_empty:
-            ls = [
-                m
-                for m in sorted(
-                    mesh.split(only_watertight=False),
-                    key=lambda _: np.linalg.norm(_.bounds[1] - _.bounds[0]),
-                    reverse=True,
-                )
-                if np.linalg.norm(m.vertices - head_center[i], axis=1).min() <= cup_radius
-            ]
+            ls = []
+            splits = mesh.split(only_watertight=False)
+            splits = splits.tolist() if isinstance(splits, np.ndarray) else list(splits)
+
+            for m in sorted(
+                splits,
+                key=lambda x: float(np.linalg.norm(x.bounds[1] - x.bounds[0])),
+                reverse=True,
+            ):
+                # 剔除远离髋臼杯所在球体的分离体，例如内固定钢板
+                if np.linalg.norm(m.vertices - head_center[i], axis=1).min() > cup_radius:
+                    continue
+
+                # 剔除内层空腔分离体
+                # if np.sum(np.sum(m.face_normals * (m.triangles_center - m.bounds.mean(axis=0)), axis=1) * m.area_faces) < 0:
+                #     continue
+
+                ls.append(m)
 
             if len(ls):
-                mesh: trimesh.Trimesh = trimesh.util.concatenate(ls)  # noqa
+                # 合并所有有效的分离体，例如颈部伪影导致断开的股骨柄
+                mesh: trimesh.Trimesh = trimesh.util.concatenate(ls)
                 mesh.fix_normals()
             else:
                 raise RuntimeError(f'{part} metal is far')
@@ -272,9 +297,9 @@ def launch(config_file: str, max_workers: int):
 
     cfg, pairs = load_pairs(cfg, ['roi', 'context', 'align'])
 
-    # for _ in tqdm(['3212905_L', '1004333_L', '1105282_R', '1203526_R']):
-    #     main(cfg, pairs[_])
-    # return
+    for _ in tqdm(['2389918_L']):
+        main(cfg, pairs[_])
+    return
 
     # 按股骨柄型号抽取验证集和测试集
     stem = {}

@@ -29,6 +29,7 @@ def main():
     cfg = tomlkit.loads(config_path.read_text('utf-8')).unwrap()
 
     train_root = Path(str(cfg['train']['root']))
+    dataset_root = Path(cfg['dataset']['root'])
     ckpt_dir = train_root / 'checkpoints'
 
     task = 'rflow'
@@ -43,7 +44,16 @@ def main():
     for f in (train_root / 'latents').glob('*.npy'):
         prl = '_'.join(f.name.removesuffix('.npy').split('_')[:2])
         if prl in test_prls and prl not in cfg['pairs']['excluded']:
-            test_files.append({'image': f.as_posix(), 'prl': prl})
+            pid, rl = prl.split('_')
+            ctx_f = dataset_root / 'pair' / pid / rl / 'context.toml'
+            if ctx_f.exists():
+                test_files.append({
+                    'image': f.as_posix(),
+                    'prl': prl,
+                    'context': tomlkit.loads(ctx_f.read_text('utf-8')).unwrap()
+                })
+            else:
+                raise RuntimeError(f'Non-exist {ctx_f.as_posix()}')
 
     if args.num_samples > 0:
         test_files = test_files[: args.num_samples]
@@ -75,19 +85,30 @@ def main():
     test_loader = DataLoader(test_ds, batch_size=1, num_workers=cfg_rflow['num_workers'])
 
     # 4. Load RFlow Model
-    rflow = define.rflow_unet().to(device)
+    embed_dim = 256
+    rflow = define.rflow_unet(context_embedding_size=embed_dim).to(device)
+    context_embedder = define.ContextEmbedder(embed_dim=embed_dim).to(device)
+    
     ckpt_path = Path(args.checkpoint) if args.checkpoint else (ckpt_dir / f'{task}_last.pt')
     print(f'Loading RFlow: {ckpt_path}')
     ckpt = torch.load(ckpt_path, map_location=device)
 
-    if 'ema_state' in ckpt:
-        rflow.load_state_dict(ckpt['ema_state'])
-        print('Loaded EMA weights.')
+    if 'rflow_state_ema' in ckpt:
+        rflow.load_state_dict(ckpt['rflow_state_ema'])
+        print('Loaded RFlow EMA weights.')
     else:
-        rflow.load_state_dict(ckpt['state_dict'])
-        print('Loaded raw state_dict.')
+        rflow.load_state_dict(ckpt['rflow_state'])
+        print('Loaded RFlow raw state_dict.')
+
+    if 'context_state_ema' in ckpt:
+        context_embedder.load_state_dict(ckpt['context_state_ema'])
+        print('Loaded ContextEmbedder EMA weights.')
+    elif 'context_state' in ckpt:
+        context_embedder.load_state_dict(ckpt['context_state'])
+        print('Loaded ContextEmbedder raw state_dict.')
 
     rflow.eval()
+    context_embedder.eval()
 
     scheduler = define.scheduler_rflow()
     cfg_guidance = args.guidance if args.guidance is not None else cfg_rflow['classifier_free_guidance']
@@ -118,7 +139,7 @@ def main():
             progress=False,
         )
 
-    amp_ctx = torch.amp.autocast('cuda')
+    amp_ctx = torch.autocast(device_type=device.type)
     ssim_calc = SSIMMetric(spatial_dims=3, data_range=2.0)
 
     print(f'Starting Full Evaluation ({args.steps_n} vs 50)...')
@@ -127,6 +148,15 @@ def main():
             image = batch['image'].to(device)
             cond = batch['condition'].to(device)
             uncond = torch.zeros_like(cond)
+
+            brand_id = batch['brand_id'].to(device)
+            size_id = batch['size_id'].to(device)
+            numerics = batch['numerics'].to(device)
+            masks = batch['masks'].to(device)
+
+            context = context_embedder(brand_id, size_id, numerics, masks)
+            uncond_context = context_embedder(brand_id, size_id, numerics, torch.zeros_like(masks))
+            context_input = torch.cat([context, uncond_context])
 
             # Same noise for both inferences
             generator = torch.Generator(device=device).manual_seed(42)
@@ -141,7 +171,8 @@ def main():
             with amp_ctx:
                 for t, next_t in zip(timesteps_n, next_timesteps_n):
                     model_input = torch.cat([torch.cat([gn] * 2), torch.cat([cond, uncond])], dim=1)
-                    v_batch = rflow(model_input, t.repeat(2))
+                    t_input = t[None].to(device).repeat(2)
+                    v_batch = rflow(model_input, t_input, context=context_input)
                     v_c, v_u = v_batch.chunk(2)
                     v_final = v_u + cfg_guidance * (v_c - v_u)
                     gn, _ = scheduler.step(v_final, t, gn, next_t)
@@ -155,7 +186,8 @@ def main():
             with amp_ctx:
                 for t, next_t in zip(timesteps_50, next_timesteps_50):
                     model_input = torch.cat([torch.cat([g50] * 2), torch.cat([cond, uncond])], dim=1)
-                    v_batch = rflow(model_input, t.repeat(2))
+                    t_input = t[None].to(device).repeat(2)
+                    v_batch = rflow(model_input, t_input, context=context_input)
                     v_c, v_u = v_batch.chunk(2)
                     v_final = v_u + cfg_guidance * (v_c - v_u)
                     g50, _ = scheduler.step(v_final, t, g50, next_t)
