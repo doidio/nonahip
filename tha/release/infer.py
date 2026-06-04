@@ -212,6 +212,11 @@ FEMORAL = {
 BRANDS = sorted(list(FEMORAL.keys()))
 SIZES = sorted(list({s for sizes in FEMORAL.values() for s in sizes}))
 
+CUP_OUTER = [38.0, 62.0, 44.0, 2.0]
+HEAD_OUTER = [22.0, 44.0, 32.0, 2.0]
+HEAD_OFFSET = [-5.0, 9.0, 0.0, 1.0]
+LINER_OFFSET = [0.0, 6.0, 0.0, 1.0]
+
 
 def _printf(*args):
     print(*args)
@@ -246,10 +251,10 @@ def parse_context(brands, sizes, stem_brand=None, stem_size=None, cup_outer=None
             return 0.0, 0.0
         return 2.0 * (float(val) - min_val) / (max_val - min_val) - 1.0, 1.0
 
-    cup_outer_val, cup_outer_mask = min_max_scale(cup_outer, 38.0, 62.0)
-    head_outer_val, head_outer_mask = min_max_scale(head_outer, 22.0, 44.0)
-    head_offset_val, head_offset_mask = min_max_scale(head_offset, -5.0, 9.0)
-    liner_offset_val, liner_offset_mask = min_max_scale(liner_offset, 0.0, 6.0)
+    cup_outer_val, cup_outer_mask = min_max_scale(cup_outer, *CUP_OUTER[:2])
+    head_outer_val, head_outer_mask = min_max_scale(head_outer, *HEAD_OUTER[:2])
+    head_offset_val, head_offset_mask = min_max_scale(head_offset, *HEAD_OFFSET[:2])
+    liner_offset_val, liner_offset_mask = min_max_scale(liner_offset, *LINER_OFFSET[:2])
 
     nums = [cup_outer_val, head_outer_val, head_offset_val, liner_offset_val]
     masks = [brand_mask, size_mask, cup_outer_mask, head_outer_mask, head_offset_mask, liner_offset_mask]

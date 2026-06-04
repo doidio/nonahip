@@ -1,18 +1,17 @@
 # uv run streamlit run release/app.py --server.port 8505 -- --config config.toml
 
 import argparse
-import copy
 from pathlib import Path
+from typing import Literal
 
 import itk
 import numpy as np
-import plotly.express as px
 import streamlit as st
 import tomlkit
-from infer import FEMORAL
+from infer import CUP_OUTER, FEMORAL, HEAD_OFFSET, HEAD_OUTER, LINER_OFFSET
 
 st.set_page_config('Nonavox/THA', initial_sidebar_state='collapsed', layout='wide')
-st.markdown('### Nonavox/THA 推理')
+st.markdown('### Nonavox/THA 假体预测生成')
 
 
 # @st.cache_resource(show_spinner=False)
@@ -51,35 +50,124 @@ def cache_load_pairs(config_file: str):
     return cfg, tests
 
 
+def it_desc(it):
+    rt = [it['prl']]
+
+    spec = it['context']['femoral_spec']
+
+    if len(spec[0]):
+        rt.append(f'型号: {spec[0]}')
+
+    if len(spec[1]):
+        rt.append(f'规格: {spec[1]}')
+
+    cup_outer = str(it['context'].get('cup_outer_best', it['context'].get('cup_outer', '')))
+
+    if len(cup_outer):
+        rt.append(f'杯径: {cup_outer}')
+
+    liner_offset = str(it['context'].get('liner_offset_best', it['context'].get('liner_offset', '')))
+
+    if len(liner_offset):
+        rt.append(f'衬偏: {liner_offset}')
+
+    head_outer = str(it['context'].get('head_outer', ''))
+
+    if len(head_outer):
+        rt.append(f'头径: {head_outer}')
+
+    return ' '.join(rt)
+
+
+def fast_drr(a, ax, th=(0.05, 1.0), mode: Literal['mean', 'max'] = 'mean'):
+    a = a.copy()
+    c = th[0] < a
+    a *= c
+    if mode == 'mean':
+        a = a.sum(axis=ax)
+        c = np.sum(c, axis=ax)
+        c[np.where(c <= 0)] = 1
+        a = a / c
+    elif mode == 'max':
+        a = a.max(axis=ax)
+
+    return a
+
+
 @st.cache_data(show_spinner='正在作图', show_time=True)
-def gen_slice_images(prl, canvas_name, ax, k_min, k_max, _canvas, _cup, _stem):
+def render_drr(prl, canvas_t, ax, white, green, blue) -> list:
+    w = fast_drr(white, ax).transpose(1, 0)
+    g = fast_drr(green, ax).transpose(1, 0)
+    b = fast_drr(blue, ax).transpose(1, 0)
+
+    if ax in (0, 1):
+        w, g, b = np.flipud(w), np.flipud(g), np.flipud(b)
+
+    rgb = np.stack([w, w, w], axis=-1)
+
+    g_mask = g > 0.0
+    rgb[g_mask] = (1.0 - rgb[g_mask]) * 0.5 + np.array([0.5, 1.0, 0.5]) * 0.5
+
+    b_mask = b > 0.0
+    rgb[b_mask] = (1.0 - rgb[b_mask]) * 0.5 + np.array([0.0, 0.5, 1.0]) * 0.5
+
+    gb_mask = g_mask & b_mask
+    rgb[gb_mask] = (1.0 - rgb[gb_mask]) * 0.5 + np.array([0.25, 0.75, 0.75]) * 0.5
+
+    rgb = np.clip(rgb, 0.0, 1.0)
+    rgb_uint8 = (rgb * 255).astype(np.uint8)
+    return [(0, rgb_uint8)]
+
+
+@st.cache_data(show_spinner='正在作图', show_time=True)
+def render_slices(prl, canvas_t, ax, white, green, blue) -> list:
+    axes = tuple(i for i in range(3) if i != ax)
+    g_ax = np.any(green > 0.5, axis=axes)
+    b_ax = np.any(blue > 0.5, axis=axes)
+
+    g_indices = np.where(g_ax)[0]
+    b_indices = np.where(b_ax)[0]
+
+    g_min = g_indices[0] if len(g_indices) > 0 else 0
+    g_max = g_indices[-1] if len(g_indices) > 0 else 0
+    b_min = b_indices[0] if len(b_indices) > 0 else 0
+    b_max = b_indices[-1] if len(b_indices) > 0 else 0
+
+    if len(g_indices) > 0 and len(b_indices) > 0:
+        k_min, k_max = min(g_min, b_min), max(g_max, b_max)
+    else:
+        k_min, k_max = g_min or b_min, g_max or b_max
+
     kn = k_max - k_min + 1
-    slice_images = []
+    slices = []
     for i in range(kn):
         k = k_max - i
-        p = np.take(_canvas, k, axis=ax).transpose(1, 0)
-        c = np.take(_cup, k, axis=ax).transpose(1, 0)
-        s = np.take(_stem, k, axis=ax).transpose(1, 0)
+        w = np.take(white, k, axis=ax).transpose(1, 0)
+        g = np.take(green, k, axis=ax).transpose(1, 0)
+        b = np.take(blue, k, axis=ax).transpose(1, 0)
 
         if ax in (0, 1):
-            p, c, s = np.flipud(p), np.flipud(c), np.flipud(s)
+            w, g, b = np.flipud(w), np.flipud(g), np.flipud(b)
 
-        rgb = np.stack([p, p, p], axis=-1)
+        rgb = np.stack([w, w, w], axis=-1)
 
-        c_mask = c > 0.0
-        rgb[c_mask] = (1.0 - rgb[c_mask]) * 0.5 + np.array([0.5, 1.0, 0.5]) * 0.5
+        g_mask = g > 0.0
+        rgb[g_mask] = (1.0 - rgb[g_mask]) * 0.5 + np.array([0.5, 1.0, 0.5]) * 0.5
 
-        s_mask = s > 0.0
-        rgb[s_mask] = (1.0 - rgb[s_mask]) * 0.5 + np.array([0.0, 0.5, 1.0]) * 0.5
+        b_mask = b > 0.0
+        rgb[b_mask] = (1.0 - rgb[b_mask]) * 0.5 + np.array([0.0, 0.5, 1.0]) * 0.5
+
+        gb_mask = g_mask & b_mask
+        rgb[gb_mask] = (1.0 - rgb[gb_mask]) * 0.5 + np.array([0.25, 0.75, 0.75]) * 0.5
 
         rgb = np.clip(rgb, 0.0, 1.0)
         rgb_uint8 = (rgb * 255).astype(np.uint8)
-        slice_images.append((k, rgb_uint8))
-    return slice_images
+        slices.append((k, rgb_uint8))
+    return slices
 
 
 if (it := st.session_state.get('init')) is None:
-    gen_slice_images.clear()
+    render_slices.clear()
 
     with st.spinner('初始化', show_time=True):
         parser = argparse.ArgumentParser()
@@ -97,36 +185,7 @@ elif (it := st.session_state.get('prl')) is None:
         st.warning('测试集为空')
         st.stop()
 
-    def format_func(_):
-        rt = [f'{_}']
-
-        spec = tests[_]['context']['femoral_spec']
-
-        if len(spec[0]):
-            rt.append(f'型号: {spec[0]}')
-
-        if len(spec[1]):
-            rt.append(f'规格: {spec[1]}')
-
-        cup_outer = str(tests[_]['context'].get('cup_outer_best', tests[_]['context'].get('cup_outer', '')))
-
-        if len(cup_outer):
-            rt.append(f'杯径: {cup_outer}')
-
-        liner_offset = str(tests[_]['context'].get('liner_offset_best', tests[_]['context'].get('liner_offset', '')))
-
-        if len(liner_offset):
-            rt.append(f'衬偏: {liner_offset}')
-
-        head_outer = str(tests[_]['context'].get('head_outer', ''))
-
-        if len(head_outer):
-            rt.append(f'头径: {head_outer}')
-
-        return ' '.join(rt)
-
-    prl = st.selectbox('测试集', list(sorted(tests.keys())), format_func=format_func)
-    it = tests[prl]
+    prl = st.selectbox('测试集', list(sorted(tests.keys())), format_func=lambda _: it_desc(tests[_]))
 
     dataset = Path(cfg['train']['root']) / 'dataset'
 
@@ -152,61 +211,91 @@ elif (it := st.session_state.get('prl')) is None:
 
         st.rerun()
 
-    st.code(tomlkit.dumps(it), 'toml')
+    st.code(tomlkit.dumps(tests[prl]), 'toml')
 
 else:
     cfg, tests = st.session_state['init']
     prl, pre, post_align_hip, post_align_femur, cup, stem = st.session_state['prl']
     it = tests[prl]
+    desc = it_desc(it)
 
-    with st.expander(prl, expanded=False):
+    with st.expander(f'{desc}', expanded=False):
         st.code(tomlkit.dumps(it), 'toml')
 
-    cols = st.columns(3)
+    cols = st.columns([2, 4, 1, 1])
 
-    canvas_dict = {'术前': pre, '术后对齐骨盆': post_align_hip, '术后对齐股骨': post_align_femur}
-    canvas_name = cols[0].radio('底图', list(canvas_dict.keys()), horizontal=True)
-    canvas = canvas_dict[canvas_name]
+    canvas = {'术前': pre, '术后对齐骨盆': post_align_hip, '术后对齐股骨': post_align_femur}
+    canvas_t = cols[0].radio('空间', list(canvas.keys()), horizontal=True)
+    canvas = canvas[canvas_t]
 
-    ax = {'冠状面': 1, '矢状面': 0, '横断面': 2}
-    ax = ax[cols[1].radio('方位', list(ax.keys()), horizontal=True)]
+    ax = {'正位': 1, '侧位': 0, '轴位': 2}
+    ax_t = cols[0].radio('方位', list(ax.keys()), horizontal=True)
+    ax = ax[ax_t]
 
-    cn = cols[2].number_input('列数', 1, 100, 10)
+    render_t = cols[0].radio('渲染', ['透视', '断层', '三维'], horizontal=True)
 
-    axes = tuple(i for i in range(3) if i != ax)
-    cup_ax = np.any(cup > 0.5, axis=axes)
-    stem_ax = np.any(stem > 0.5, axis=axes)
+    metal = cols[0].radio('假体', ['真实术后', '预测生成'], horizontal=True)
 
-    cup_indices = np.where(cup_ax)[0]
-    stem_indices = np.where(stem_ax)[0]
+    cn = cols[0].number_input('列数', 1, 100, 10, 1, width=200)
 
-    cup_min = cup_indices[0] if len(cup_indices) > 0 else 0
-    cup_max = cup_indices[-1] if len(cup_indices) > 0 else 0
-    stem_min = stem_indices[0] if len(stem_indices) > 0 else 0
-    stem_max = stem_indices[-1] if len(stem_indices) > 0 else 0
+    if cols[1].checkbox('型号'):
+        spec_0 = cols[1].radio('型号', [_ for _ in FEMORAL.keys() if len(_)], horizontal=True, label_visibility='collapsed')
 
-    if len(cup_indices) > 0 and len(stem_indices) > 0:
-        k_min, k_max = min(cup_min, stem_min), max(cup_max, stem_max)
+        if cols[1].checkbox('规格'):
+            spec_1 = cols[1].radio('规格', [_ for _ in FEMORAL[spec_0] if len(_)], horizontal=True, label_visibility='collapsed')
+        else:
+            spec_1 = None
     else:
-        k_min, k_max = cup_min or stem_min, cup_max or stem_max
+        spec_0, spec_1 = None, None
 
-    slice_images = gen_slice_images(prl, canvas_name, ax, k_min, k_max, canvas, cup, stem)
-    with st.expander('真值 Ground Truth'):
-        kn = len(slice_images)
-        for i in range(0, kn, cn):
+    if cols[2].checkbox('杯径'):
+        cup_outer = cols[2].number_input('杯径', CUP_OUTER[0], CUP_OUTER[1], CUP_OUTER[2], CUP_OUTER[3])
+    else:
+        cup_outer = None
+
+    if cols[2].checkbox('头径'):
+        head_outer = cols[2].number_input('头径', HEAD_OUTER[0], HEAD_OUTER[1], HEAD_OUTER[2], HEAD_OUTER[3])
+    else:
+        head_outer = None
+
+    if cols[3].checkbox('头偏'):
+        head_offset = cols[3].number_input('头偏', HEAD_OFFSET[0], HEAD_OFFSET[1], HEAD_OFFSET[2], HEAD_OFFSET[3])
+    else:
+        head_offset = None
+
+    if cols[3].checkbox('衬偏'):
+        liner_offset = cols[3].number_input('衬偏', LINER_OFFSET[0], LINER_OFFSET[1], LINER_OFFSET[2], LINER_OFFSET[3])
+    else:
+        liner_offset = None
+
+    cols = st.columns([2, 2, 1, 1, 1, 1], vertical_alignment='bottom')
+
+    if cols[2].checkbox('可复现'):
+        seed = cols[3].number_input('随机种子', 0, None, 42, 1)
+        instances = 1
+    else:
+        seed = None
+        instances = cols[3].number_input('随机数量', 1, 100, 10, 1)
+
+    cfg_val = cols[4].number_input('CFG', 0.0, 9.0, 1.0, 1.0)
+    ts = cols[5].number_input('Timesteps', 1, 50, 5, 1)
+
+    if cols[1].button('生成', width='stretch'):
+        cond = Path(cfg['train']['root']) / 'dataset' / 'pre' / f'{prl}.nii.gz'
+
+    if render_t == '透视':
+        images = render_drr(prl, canvas_t, ax, canvas, cup, stem)
+    elif render_t == '断层':
+        images = render_slices(prl, canvas_t, ax, canvas, cup, stem)
+    elif render_t == '三维':
+        images = []
+    else:
+        images = []
+
+    with st.expander(f'{canvas_t}{ax_t}{render_t}{metal}假体', expanded=True):
+        for i in range(0, len(images), cn):
             cols = st.columns(cn)
             for j in range(cn):
-                if i + j < kn:
-                    k, rgb = slice_images[i + j]
-                    cols[j].image(rgb, '{} = {}'.format('XYZ'[ax], k))
-
-    # femoral = {}
-    # for orig_a in FEMORAL:
-    #     a = '<空>' if len(orig_a) == 0 else orig_a
-    #     femoral[a] = {}
-    #     for orig_b in FEMORAL[orig_a]:
-    #         b = '<空>' if len(orig_b) == 0 else orig_b
-    #         femoral[a][b] = orig_b
-
-    # spec_0 = st.radio('型号', list(femoral.keys()), horizontal=True)
-    # sepc_1 = st.radio('规格', list(femoral[spec_0].keys()), horizontal=True)
+                if i + j < len(images):
+                    caption, rgb = images[i + j]
+                    cols[j].image(rgb, '{} = {}'.format('XYZ'[ax], caption) if render_t == '断层' else None)

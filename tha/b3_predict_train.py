@@ -297,39 +297,40 @@ def launch(config_file: str, max_workers: int):
 
     cfg, pairs = load_pairs(cfg, ['roi', 'context', 'align'])
 
-    for _ in tqdm(['2389918_L']):
-        main(cfg, pairs[_])
-    return
+    # for _ in tqdm(['2389918_L']):
+    #     main(cfg, pairs[_])
+    # return
 
     # 按股骨柄型号抽取验证集和测试集
-    stem = {}
-    for prl, it in pairs.items():
-        if it.get('excluded', False):
-            continue
+    if len(cfg.get('val', [])) == 0 and len(cfg.get('test', [])) == 0:
+        stem = {}
+        for prl, it in pairs.items():
+            if it.get('excluded', False):
+                continue
 
-        if 'femoral_spec' not in it['context']:
-            continue
+            if 'femoral_spec' not in it['context']:
+                continue
 
-        spec = it['context']['femoral_spec'][0]
-        if spec not in stem:
-            stem[spec] = []
-        stem[spec].append(prl)
+            spec = it['context']['femoral_spec'][0]
+            if spec not in stem:
+                stem[spec] = []
+            stem[spec].append(prl)
 
-    trains, vals, tests = {}, {}, {}
-    for spec, ls in stem.items():
-        for _ in range(10):
-            if len(ls):
-                trains[ls.pop()] = spec
+        trains, vals, tests = {}, {}, {}
+        for spec, ls in stem.items():
+            for _ in range(10):
+                if len(ls):
+                    trains[ls.pop()] = spec
 
-            if len(ls):
-                vals[ls.pop()] = spec
+                if len(ls):
+                    vals[ls.pop()] = spec
 
-            if len(ls) and _ < 3:
-                tests[ls.pop()] = spec
+                if len(ls) and _ < 3:
+                    tests[ls.pop()] = spec
 
-    cfg['val'] = vals
-    cfg['test'] = tests
-    Path(config_file).write_text(tomlkit.dumps(cfg), 'utf-8')
+        cfg['val'] = vals
+        cfg['test'] = tests
+        Path(config_file).write_text(tomlkit.dumps(cfg), 'utf-8')
 
     tasks = [(cfg, it) for prl, it in pairs.items()]
 
