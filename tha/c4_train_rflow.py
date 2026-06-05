@@ -469,7 +469,6 @@ def main():
 
                             with torch.no_grad():
                                 generated, _ = scheduler.step(velocity_pred, t, generated, next_t)
-                                # 设计妥协说明：移除 valid_mask 的乘积清零操作
 
                         val_bar.set_postfix({})
 

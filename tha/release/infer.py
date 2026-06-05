@@ -1,8 +1,15 @@
-import argparse
 from contextlib import nullcontext
 from pathlib import Path
+from typing import cast
 
+import itk
 import numpy as np
+import torch
+from monai.inferers import sliding_window_inference
+from monai.networks.nets import AutoencoderKL, DiffusionModelUNet
+from monai.networks.schedulers import RFlowScheduler
+from monai.transforms import CenterSpatialCrop, Compose, DivisiblePadd, EnsureChannelFirstd, LoadImaged, SpatialPadd
+from torch import autocast
 
 FEMORAL = {
     '': [''],
@@ -218,6 +225,20 @@ HEAD_OFFSET = [-5.0, 9.0, 0.0, 1.0]
 LINER_OFFSET = [0.0, 6.0, 0.0, 1.0]
 
 
+def bone_normalize(ct_value: float) -> float:
+    if 150.0 <= ct_value < 650.0:
+        value = -1.0 + (ct_value - 150.0) / 500.0 * 1.0
+    elif 650.0 <= ct_value < 1150.0:
+        value = 0.0 + (ct_value - 650.0) / 500.0 * 0.5
+    elif 1150.0 <= ct_value < 3150.0:
+        value = 0.5 + (ct_value - 1150.0) / 2000.0 * 0.5
+    elif ct_value >= 3150.0:
+        value = 1.0
+    else:
+        value = -1.0
+    return value
+
+
 def _printf(*args):
     print(*args)
 
@@ -267,10 +288,9 @@ def parse_context(brands, sizes, stem_brand=None, stem_size=None, cup_outer=None
     )
 
 
-def diff_dmc(volume, origin, spacing, threshold):
+def diff_dmc(volume, origin, spacing, direction, threshold):
     """
-    完全复制自 kernel.py:diff_dmc
-    volume: [D, H, W] torch.Tensor
+    volume: [X, Y, Z] torch.Tensor
     """
     import torch
     import trimesh
@@ -281,82 +301,49 @@ def diff_dmc(volume, origin, spacing, threshold):
     vertices, indices = DiffDMC(dtype=torch.float32)(-volume, None, isovalue=-threshold)
     vertices, indices = vertices.cpu().numpy(), indices.cpu().numpy()
 
-    # 这里的 volume.shape 是 (D, H, W)
-    # vertices 对应索引 [z, y, x]
-    vertices = vertices * spacing * (np.array(volume.shape) - 1) + origin
-    return trimesh.Trimesh(vertices, indices)
+    # volume.shape 是 (X, Y, Z)
+    # vertices 对应索引 [x, y, z] 归一化在 [0, 1] 之间
+    I = vertices * (np.array(volume.shape) - 1)
+
+    direction = np.array(direction)[:3, :3]
+    spacing = np.array(spacing)[:3]
+
+    # 物理坐标 = origin + direction * (I * spacing)
+    physical = (I * spacing) @ direction.T + origin
+    return trimesh.Trimesh(physical, indices)
 
 
-def main(
-    cond,
-    save,
-    stem_brand=None,
-    stem_size=None,
-    cup_outer=None,
-    head_outer=None,
-    head_offset=None,
-    liner_offset=None,
-    vae_pre=None,
-    vae_metal=None,
-    rflow=None,
-    cpu=False,
-    amp=True,
-    sw=4,
-    seed=None,
-    cfg=3.0,
-    ts=5,
-    printf=_printf,
-):
-    # 参数后处理
-    sw_batch_size = max(sw, 1)
-    cfg_val = max(float(cfg), 0.0)
+class ContextEmbedder(torch.nn.Module):
+    """将手术设计参数编码为全局条件向量序列 [B, 6, C]"""
 
-    import time
+    def __init__(self, brands, sizes, embed_dim=256):
+        super().__init__()
+        self.brand_emb = torch.nn.Embedding(len(brands), embed_dim)
+        self.size_emb = torch.nn.Embedding(len(sizes), embed_dim)
 
-    start_total = time.time()
+        self.cup_outer_proj = torch.nn.Linear(1, embed_dim)
+        self.head_outer_proj = torch.nn.Linear(1, embed_dim)
+        self.head_offset_proj = torch.nn.Linear(1, embed_dim)
+        self.liner_offset_proj = torch.nn.Linear(1, embed_dim)
 
-    # 延迟导入以加快命令行响应速度
-    import torch
+    def forward(self, brand_id, size_id, numerics, masks=None):
+        brand_embed = self.brand_emb(brand_id)  # [B, C]
+        size_embed = self.size_emb(size_id)  # [B, C]
 
-    if not cpu:
-        torch.backends.cudnn.benchmark = True
+        cup_outer_embed = self.cup_outer_proj(numerics[:, 0:1])  # [B, C]
+        head_outer_embed = self.head_outer_proj(numerics[:, 1:2])  # [B, C]
+        head_offset_embed = self.head_offset_proj(numerics[:, 2:3])  # [B, C]
+        liner_offset_embed = self.liner_offset_proj(numerics[:, 3:4])  # [B, C]
 
-    from monai.inferers import sliding_window_inference
-    from monai.networks.nets import AutoencoderKL, DiffusionModelUNet
-    from monai.networks.schedulers import RFlowScheduler
-    from monai.transforms import CenterSpatialCrop, Compose, DivisiblePadd, EnsureChannelFirstd, LoadImaged, SpatialPadd
-    from torch import autocast
+        out = torch.stack([brand_embed, size_embed, cup_outer_embed, head_outer_embed, head_offset_embed, liner_offset_embed], dim=1)
 
-    class ContextEmbedder(torch.nn.Module):
-        """将手术设计参数编码为全局条件向量序列 [B, 6, C]"""
+        if masks is not None:
+            out = out * masks.unsqueeze(-1)
 
-        def __init__(self, brands, sizes, embed_dim=256):
-            super().__init__()
-            self.brand_emb = torch.nn.Embedding(len(brands), embed_dim)
-            self.size_emb = torch.nn.Embedding(len(sizes), embed_dim)
+        return out
 
-            self.cup_outer_proj = torch.nn.Linear(1, embed_dim)
-            self.head_outer_proj = torch.nn.Linear(1, embed_dim)
-            self.head_offset_proj = torch.nn.Linear(1, embed_dim)
-            self.liner_offset_proj = torch.nn.Linear(1, embed_dim)
 
-        def forward(self, brand_id, size_id, numerics, masks=None):
-            brand_embed = self.brand_emb(brand_id)  # [B, C]
-            size_embed = self.size_emb(size_id)  # [B, C]
-
-            cup_outer_embed = self.cup_outer_proj(numerics[:, 0:1])  # [B, C]
-            head_outer_embed = self.head_outer_proj(numerics[:, 1:2])  # [B, C]
-            head_offset_embed = self.head_offset_proj(numerics[:, 2:3])  # [B, C]
-            liner_offset_embed = self.liner_offset_proj(numerics[:, 3:4])  # [B, C]
-
-            out = torch.stack([brand_embed, size_embed, cup_outer_embed, head_outer_embed, head_offset_embed, liner_offset_embed], dim=1)
-
-            if masks is not None:
-                out = out * masks.unsqueeze(-1)
-
-            return out
-
-    # 设备选择
+def i1_load_models(vae_pre_path=None, vae_metal_path=None, rflow_path=None, cpu=False, printf=_printf):
     if cpu:
         device = torch.device('cpu')
     else:
@@ -366,28 +353,28 @@ def main(
 
     # 加载 VAE 模型 (AutoencoderKL)
     vae_dual = []
-    for subtask in ('metal', 'pre'):
-        vae_path_arg = {'pre': vae_pre, 'metal': vae_metal}.get(subtask)
-        if vae_path_arg is None:
-            vae_path = Path(__file__).parent.parent.parent.parent.parent / 'public-ssd/train-tha/checkpoints' / f'vae_{subtask}_best.pt'
+    for subtask in ('pre', 'metal'):
+        arg = {'pre': vae_pre_path, 'metal': vae_metal_path}.get(subtask)
+        if arg is None:
+            f = Path(__file__).parent / f'vae_{subtask}_best.pt'
         else:
-            vae_path = Path(vae_path_arg)
+            f = Path(arg)
 
-        if not vae_path.exists():
-            raise SystemError(f'Not found:\t {vae_path.resolve()}')
+        if not f.exists():
+            raise SystemError(f'Not found:\t {f.resolve()}')
         else:
-            printf('VAE:\t [{0}] {1}'.format(subtask, vae_path.resolve()))
+            printf('VAE:\t [{0}] {1}'.format(subtask, f.resolve()))
 
         # 加载模型
-        loaded = torch.load(vae_path, map_location='cpu', weights_only=False)
+        loaded = torch.load(f, map_location='cpu', weights_only=False)
 
         printf('Epoch:\t', loaded['epoch'])
         printf('Channels:\t', channels := loaded['channels'])
-        printf('Scale Factor:\t', sf := loaded['scale_factor'])
-        printf('Global Mean:\t', mean := loaded['global_mean'])
+        printf('Scale Factor:\t', loaded['scale_factor'])
+        printf('Global Mean:\t', loaded['global_mean'])
 
         # 初始化 VAE 网络结构
-        vae = AutoencoderKL(
+        vae_model = AutoencoderKL(
             spatial_dims=3,
             in_channels=channels,
             out_channels=channels,
@@ -402,24 +389,25 @@ def main(
         ).to(device)
 
         # 加载权重
-        vae.load_state_dict(loaded['state_dict'])
-        vae.eval().float()
-        printf('Param:\t {0:.2f} B'.format(sum(p.numel() for p in vae.parameters()) / 1e9))
+        vae_model.load_state_dict(loaded['state_dict'])
+        vae_model.eval().float()
+        printf('Param:\t {0:.2f} B'.format(sum(p.numel() for p in vae_model.parameters()) / 1e9))
 
-        vae_dual += [vae, sf, mean, channels]
-
-    vae_image, vae_image_scale, vae_image_mean, vae_image_channels, vae_cond, vae_cond_scale, vae_cond_mean, vae_cond_channels = vae_dual
+        vae_dual.append((vae_model, loaded['scale_factor'], loaded['global_mean'], loaded['channels']))
 
     # 加载 RFlow 模型 (DiffusionModelUNet)
-    if rflow is None:
-        rflow_path = Path(__file__).parent.parent.parent.parent.parent / 'public-ssd/train-tha/checkpoints' / 'rflow_last.pt'
+    if rflow_path is None:
+        rflow_path = Path(__file__).parent / 'rflow_last.pt'
     else:
-        rflow_path = Path(rflow)
+        rflow_path = Path(rflow_path)
 
     if not rflow_path.exists():
         raise SystemError(f'Not found:\t {rflow_path.resolve()}')
     else:
         printf('RFlow:\t {0}'.format(rflow_path.resolve()))
+
+    loaded = torch.load(rflow_path, map_location=device)
+    printf('Epoch:\t {0}'.format(loaded['epoch']))
 
     rflow_model = DiffusionModelUNet(
         spatial_dims=3,
@@ -435,11 +423,9 @@ def main(
         use_flash_attention=not cpu,
     ).to(device)
 
-    context_embedder = ContextEmbedder(brands=BRANDS, sizes=SIZES, embed_dim=256).to(device)
-
-    loaded = torch.load(rflow_path, map_location=device)
-    printf('Epoch:\t {0}'.format(loaded['epoch']))
     printf('Param:\t {0:.2f} B'.format(sum(p.numel() for p in rflow_model.parameters()) / 1e9))
+
+    context_embedder = ContextEmbedder(brands=BRANDS, sizes=SIZES, embed_dim=256).to(device)
 
     if 'rflow_state_ema' in loaded:
         rflow_model.load_state_dict(loaded['rflow_state_ema'])
@@ -463,277 +449,264 @@ def main(
     rflow_model.eval().float()
     context_embedder.eval().float()
 
-    # 初始化 RFlow 采样器
-    scheduler = RFlowScheduler(num_train_timesteps=1000)
-    scheduler.set_timesteps(ts)
-    all_timesteps = scheduler.timesteps
-    all_next_timesteps = torch.cat((all_timesteps[1:], torch.tensor([0], dtype=all_timesteps.dtype, device=all_timesteps.device)))
+    return *vae_dual, (rflow_model, context_embedder)
 
-    if ts == 1:
-        printf('RFlow 1-step mode: CFG is baked into the model weights, skipping dual-pass.')
+
+def i2_context_embed(
+    context_embedder, stem_brand=None, stem_size=None, cup_outer=None, head_outer=None, head_offset=None, liner_offset=None, cpu=False
+):
+    if cpu:
+        device = torch.device('cpu')
     else:
-        printf('CFG:\t {0} {1}'.format(cfg_val, 'Uncond-only' if cfg_val == 0 else 'Cond-only' if cfg_val == 1 else 'Guided'))
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    printf('Steps:\t {0} (RFlow Sampling)'.format(ts))
+    brand_to_id = {b: i for i, b in enumerate(BRANDS)}
+    size_to_id = {s: i for i, s in enumerate(SIZES)}
 
-    # 准备条件图像路径
-    cond_path = Path(cond)
-    if not cond_path.exists():
-        raise SystemError(f'Condition not found:\t {cond_path.resolve()}')
+    brand_val = stem_brand if stem_brand is not None else ''
+    size_val = stem_size if stem_size is not None else ''
 
-    b_id, s_id, nums, msks = parse_context(BRANDS, SIZES, stem_brand, stem_size, cup_outer, head_outer, head_offset, liner_offset)
-    b_id = b_id.to(device)
-    s_id = s_id.to(device)
-    nums = nums.to(device)
-    msks = msks.to(device)
+    if size_val and not brand_val:
+        raise ValueError('Cannot specify stem_size without specifying stem_brand.')
+
+    if brand_val not in FEMORAL:
+        raise ValueError(f"Unknown stem_brand: '{brand_val}'. Supported brands are: {list(FEMORAL.keys())}")
+
+    if size_val not in FEMORAL[brand_val]:
+        raise ValueError(f"Unknown stem_size: '{size_val}' for brand '{brand_val}'. Supported sizes are: {FEMORAL[brand_val]}")
+
+    brand_id = brand_to_id.get(brand_val, 0)
+    brand_mask = 1.0 if brand_val in brand_to_id else 0.0
+
+    size_id = size_to_id.get(size_val, 0)
+    size_mask = 1.0 if size_val in size_to_id else 0.0
+
+    def min_max_scale(val, min_val, max_val):
+        if val is None or val == '':
+            return 0.0, 0.0
+        return 2.0 * (float(val) - min_val) / (max_val - min_val) - 1.0, 1.0
+
+    cup_outer_val, cup_outer_mask = min_max_scale(cup_outer, *CUP_OUTER[:2])
+    head_outer_val, head_outer_mask = min_max_scale(head_outer, *HEAD_OUTER[:2])
+    head_offset_val, head_offset_mask = min_max_scale(head_offset, *HEAD_OFFSET[:2])
+    liner_offset_val, liner_offset_mask = min_max_scale(liner_offset, *LINER_OFFSET[:2])
+
+    nums = [cup_outer_val, head_outer_val, head_offset_val, liner_offset_val]
+    masks = [brand_mask, size_mask, cup_outer_mask, head_outer_mask, head_offset_mask, liner_offset_mask]
+
+    b_id, s_id, nums, msks = (
+        torch.tensor([brand_id], dtype=torch.long).to(device),
+        torch.tensor([size_id], dtype=torch.long).to(device),
+        torch.tensor([nums], dtype=torch.float32).to(device),
+        torch.tensor([masks], dtype=torch.float32).to(device),
+    )
 
     with torch.no_grad():
         context_emb = context_embedder(b_id, s_id, nums, msks)
-        uncond_context_emb = context_embedder(b_id, s_id, nums, torch.zeros_like(msks))
+        context_emb_uncond = context_embedder(b_id, s_id, nums, torch.zeros_like(msks))
 
-    # 准备后处理工具与原始尺寸
-    import itk
+    return context_emb, context_emb_uncond
 
-    itk_img = itk.imread(cond_path.as_posix())
-    original_itk_size = list(itk.size(itk_img))
-    printf(f'Input Size:\t {original_itk_size}')
 
-    cropper = CenterSpatialCrop(roi_size=original_itk_size)
+def i3_pre_encode(pre_path, vae_model, scale_factor, mean, channels, sw_batch_size=4, sw_overlap=0.25, cpu=False, amp=True):
+    if cpu:
+        device = torch.device('cpu')
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    pre_path = Path(pre_path)
+    if not pre_path.exists():
+        raise RuntimeError(f'Pre image not found:\t {pre_path.resolve()}')
+
+    itk_img = itk.imread(pre_path.as_posix())
+    pre_origin = list(itk.origin(itk_img))
+    pre_spacing = list(itk.spacing(itk_img))
+    pre_size = list(itk.size(itk_img))
+
+    direction = itk.GetArrayFromMatrix(itk_img.GetDirection())
 
     # 加载并归一化条件图像 [B, C, H, W, D]
     # MONAI ITKReader loads in (C, X, Y, Z) order
-    cond_transforms = Compose([
+    transforms = Compose([
         LoadImaged(keys=['image'], reader='ITKReader'),
-        EnsureChannelFirstd(keys=['image'], channel_dim=-1 if vae_cond_channels > 1 else 'no_channel'),
+        EnsureChannelFirstd(keys=['image'], channel_dim=-1 if channels > 1 else 'no_channel'),
         SpatialPadd(keys=['image'], spatial_size=(128, 128, 128), constant_values=-1.0),
         DivisiblePadd(keys=['image'], k=16, constant_values=-1.0),
     ])
-    cond_data = cond_transforms({'image': cond_path.as_posix()})
-    cond_raw = cond_data['image']
-    cond_tensor = cond_raw.unsqueeze(0).to(device)
 
-    save_dir = Path(save) / '_'.join([
-        cond_path.with_suffix('').with_suffix('').name,
-        'seed',
-        str(seed) if seed else 'random',
-        'cfg',
-        str(cfg),
-        'ts',
-        str(ts),
-    ])
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    def decode_and_save(latent_tensor):
-        """解码 Latent 並返回 (Z, Y, X, C) 格式的 numpy 数组"""
-        # 1. 反向缩放 Latent
-        z = latent_tensor / vae_image_scale + vae_image_mean
-
-        # 2. VAE 解码
-        def decode_predictor(inputs: torch.Tensor) -> torch.Tensor:
-            with autocast(device.type) if amp else nullcontext():
-                vae_latent_ch = vae_image.latent_channels
-                if inputs.shape[1] > vae_latent_ch:
-                    recons = []
-                    for i in range(0, inputs.shape[1], vae_latent_ch):
-                        recons.append(vae_image.decode(inputs[:, i : i + vae_latent_ch]))
-                    return torch.cat(recons, dim=1)
-                return vae_image.decode(inputs)
-
-        with torch.no_grad():
-            recon = sliding_window_inference(
-                inputs=z,
-                roi_size=[128 // 4 for _ in range(3)],
-                sw_batch_size=sw_batch_size,
-                predictor=decode_predictor,
-                overlap=0.25,
-                mode='gaussian',
-                device=device,
-                sw_device=device,
-                progress=False,
-            )
-
-        # 3. 裁剪与后处理
-        decoded = recon[0].detach().cpu().float()
-        decoded = cropper(decoded)
-        # decoded shape: [C, X, Y, Z]
-
-        # ITK expects (Z, Y, X, C) order for a Vector Image of size (X, Y, Z)
-        sdf_numpy = decoded.permute(3, 2, 1, 0).cpu().numpy()
-
-        return sdf_numpy
+    data = cast(dict, transforms({'image': pre_path.as_posix()}))
+    raw = data['image']
+    tensor = raw.unsqueeze(0).to(device)
 
     # VAE 编码 (Encoding)
     def encode_predictor(z):
         with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
-            return vae_cond.encode(z)[0]
+            return vae_model.encode(z)[0]
 
     with torch.no_grad():
-        cond_encoded = sliding_window_inference(
-            inputs=cond_tensor,
+        encoded = sliding_window_inference(
+            inputs=tensor,
             roi_size=(128, 128, 128),
             sw_batch_size=sw_batch_size,
             predictor=encode_predictor,
-            overlap=0.25,
+            overlap=sw_overlap,
             mode='gaussian',
             device=device,
-            progress=True,
+            progress=False,
         )
 
     # 缩放 latent 分布
-    cond_encoded = (cond_encoded - vae_cond_mean) * vae_cond_scale
-    printf('VAE encode:\t {0:.2f}s'.format(time.time() - start_total))
+    encoded = (encoded - mean) * scale_factor
 
-    # 初始化随机噪声 z_0
+    return encoded, pre_origin, pre_spacing, pre_size, direction
+
+
+def i4_rflow_sample(rflow_model, context_emb, uncond_context_emb, pre_encoded, seed=None, ts=5, cfg=1.0, cpu=False, amp=True):
+    if cpu:
+        device = torch.device('cpu')
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     if seed is not None:
         generator = torch.Generator(device=device).manual_seed(seed)
     else:
         generator = None
 
-    # Generated image latent should have 8 channels (2 output channels * 4 latent channels)
-    gen_shape = list(cond_encoded.shape)
+    gen_shape = list(pre_encoded.shape)
     gen_shape[1] = 8
     generated = torch.randn(gen_shape, device=device, generator=generator)
 
-    printf('RFlow generating...')
+    scheduler = RFlowScheduler(num_train_timesteps=1000)
+    scheduler.set_timesteps(ts)
+    all_timesteps = scheduler.timesteps
+    all_next_timesteps = torch.cat((all_timesteps[1:], torch.tensor([0], dtype=all_timesteps.dtype, device=all_timesteps.device)))
 
-    # Euler 直线积分
-    start_gen = time.time()
     for t, next_t in zip(all_timesteps, all_next_timesteps):
         # 预测直线速度场 (Velocity)
         with torch.no_grad():
-            if ts == 1:
-                # 2-RF Mode: Single pass
-                model_input = torch.cat([generated, cond_encoded], dim=1)
+            if cfg > 1.0:
+                with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
+                    model_input_cond = torch.cat([generated, pre_encoded], dim=1)
+                    velocity_cond = rflow_model(model_input_cond, t[None].to(device), context=context_emb)
+
+                    model_input_uncond = torch.cat([generated, torch.zeros_like(pre_encoded)], dim=1)
+                    velocity_uncond = rflow_model(model_input_uncond, t[None].to(device), context=uncond_context_emb)
+
+                velocity_pred = velocity_uncond + cfg * (velocity_cond - velocity_uncond)
+            elif cfg == 1.0:
+                model_input = torch.cat([generated, pre_encoded], dim=1)
                 with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
                     velocity_pred = rflow_model(model_input, t[None].to(device), context=context_emb)
             else:
-                # 1-RF Mode or Multi-step: CFG logic
-                t_input = t[None].to(device).repeat(2)
-
-                if cfg_val > 1.0:
-                    latent_input = torch.cat([generated] * 2, dim=0)
-                    cond_input = torch.cat([cond_encoded, torch.zeros_like(cond_encoded)], dim=0)
-                    context_input = torch.cat([context_emb, uncond_context_emb], dim=0)
-                    model_input = torch.cat([latent_input, cond_input], dim=1)
-
-                    with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
-                        velocity_pred_batch = rflow_model(model_input, t_input, context=context_input)
-
-                    velocity_cond, velocity_uncond = velocity_pred_batch.chunk(2)
-                    velocity_pred = velocity_uncond + cfg_val * (velocity_cond - velocity_uncond)
-                elif cfg_val == 1.0:
-                    model_input = torch.cat([generated, cond_encoded], dim=1)
-                    with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
-                        velocity_pred = rflow_model(model_input, t[None].to(device), context=context_emb)
-                else:
-                    model_input = torch.cat([generated, torch.zeros_like(cond_encoded)], dim=1)
-                    with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
-                        velocity_pred = rflow_model(model_input, t[None].to(device), context=uncond_context_emb)
+                model_input = torch.cat([generated, torch.zeros_like(pre_encoded)], dim=1)
+                with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
+                    velocity_pred = rflow_model(model_input, t[None].to(device), context=uncond_context_emb)
 
         # Euler 更新步 (x_next = x_t + dt * v_t)
         with torch.no_grad():
-            generated, _ = scheduler.step(velocity_pred, t, generated, next_t)
+            generated, _ = scheduler.step(velocity_pred, t, generated, next_t)  # type: ignore
 
-    printf('RFlow generate:\t {0:.2f}s'.format(time.time() - start_gen))
+    return generated
 
-    # 最终解码并融合
-    start_dec = time.time()
-    generated_np = decode_and_save(generated)
 
-    # 提取等值面网格体 (STL)
-    if device.type != 'cpu':
-        origin_xyz = np.array(itk_img.GetOrigin())
-        spacing_xyz = np.array(itk_img.GetSpacing())
+def i5_metal_decode(generated, roi_size, vae_model, scale_factor, mean, channels, sw_batch_size=4, sw_overlap=0.25, cpu=False, amp=True):
+    if cpu:
+        device = torch.device('cpu')
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        for i, name_suffix in enumerate(['_cup', '_stem']):
-            stl_name = cond_path.name.replace('.nii.gz', f'{name_suffix}.stl')
-            stl_path = save_dir / stl_name
+    cropper = CenterSpatialCrop(roi_size=roi_size)
 
-            final_sdf_torch = torch.from_numpy(generated_np[..., i]).to(device)
+    # 反向缩放
+    z = generated / scale_factor + mean
 
-            spacing_zyx = spacing_xyz[[2, 1, 0]]
-            origin_zyx = origin_xyz[[2, 1, 0]]
+    # VAE 解码
+    def decode_predictor(inputs: torch.Tensor) -> torch.Tensor:
+        with autocast(device.type) if amp else nullcontext():
+            vae_latent_ch = vae_model.latent_channels
+            if inputs.shape[1] > vae_latent_ch:
+                recons = []
+                for i in range(0, inputs.shape[1], vae_latent_ch):
+                    recons.append(vae_model.decode(inputs[:, i : i + vae_latent_ch]))
+                return torch.cat(recons, dim=1)
+            return vae_model.decode(inputs)
 
-            mesh = diff_dmc(final_sdf_torch, origin_zyx, spacing_zyx, threshold=0.0)
+    with torch.no_grad():
+        recon = sliding_window_inference(
+            inputs=z,
+            roi_size=[128 // 4 for _ in range(3)],
+            sw_batch_size=sw_batch_size,
+            predictor=decode_predictor,
+            overlap=sw_overlap,
+            mode='gaussian',
+            device=device,
+            sw_device=device,
+            progress=False,
+        )
 
-            mesh.vertices = mesh.vertices[:, [2, 1, 0]]
-            mesh.export(stl_path.as_posix())
+    # 还原尺寸
+    decoded = recon[0].detach().cpu().float()
+    decoded = cropper(decoded)
+    decoded_np = decoded.cpu().numpy()
 
-    # 保存最终的结果
-    # 方案 A: 保存为 4D 图像
-    save_metal = save_dir / cond_path.name.replace('.nii.gz', '_metal.nii.gz')
-    itk_metal = itk.image_from_array(np.ascontiguousarray(generated_np.transpose(3, 0, 1, 2)), is_vector=False)
-    itk_metal.SetSpacing(list(itk_img.GetSpacing()) + [1.0])
-    itk_metal.SetOrigin(list(itk_img.GetOrigin()) + [0.0])
+    return np.ascontiguousarray(decoded_np[0]), np.ascontiguousarray(decoded_np[1])
 
-    # 构造 4x4 旋转矩阵以保留原图的物理朝向
-    dir_3x3 = itk.GetArrayFromMatrix(itk_img.GetDirection())
-    dir_4x4 = np.eye(4)
-    dir_4x4[:3, :3] = dir_3x3
-    itk_metal.SetDirection(itk.GetMatrixFromArray(dir_4x4))
 
-    itk.imwrite(itk_metal, save_metal.as_posix())
+def i6_export(savedir, cup, stem, pre_path, origin, spacing, direction, cpu=False):
+    if cpu:
+        device = 'cpu'
+    else:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # 方案 B: 保存为独立文件
-    for i, name_suffix in enumerate(['_cup', '_stem']):
-        chan_path = save_dir / cond_path.name.replace('.nii.gz', f'{name_suffix}.nii.gz')
-        itk_chan = itk.image_from_array(np.ascontiguousarray(generated_np[..., i]))
-        itk_chan.SetSpacing(list(itk_img.GetSpacing())[:3])
-        itk_chan.SetOrigin(list(itk_img.GetOrigin())[:3])
-        itk_chan.SetDirection(itk.GetMatrixFromArray(dir_3x3))
-        itk.imwrite(itk_chan, chan_path.as_posix())
+    savedir = Path(savedir)
+    savedir.mkdir(parents=True, exist_ok=True)
 
-    printf('Post-process:\t {0:.2f}s'.format(time.time() - start_dec))
-    printf('Total time:\t {0:.2f}s'.format(time.time() - start_total))
+    if device == 'cuda':
+        for name, tsdf in [('cup', cup), ('stem', stem)]:
+            tensor = torch.from_numpy(tsdf).to(device)
+            mesh = diff_dmc(tensor, origin, spacing, direction, threshold=0.0)
+            mesh.export(savedir / f'{name}.stl')
+
+        image = itk.imread(pre_path.as_posix())
+        image = itk.array_from_image(image).transpose(2, 1, 0)
+        image = np.ascontiguousarray(image)
+
+        tensor = torch.from_numpy(image).to(device)
+        mesh = diff_dmc(tensor, origin, spacing, direction, threshold=bone_normalize(226))
+        mesh.export(savedir / 'pre.stl')
+
+    for name, tsdf in [('cup', cup), ('stem', stem)]:
+        tsdf_zyx = np.ascontiguousarray(tsdf.transpose(2, 1, 0))
+        image = itk.image_from_array(tsdf_zyx)
+        image.SetOrigin(origin)
+        image.SetSpacing(spacing)
+        image.SetDirection(itk.GetMatrixFromArray(np.array(direction)[:3, :3]))
+        itk.imwrite(image, savedir / f'{name}.nii.gz')
+
+    cup_mask, stem_mask = cup > 0.0, stem > 0.0
+    seg = (cup_mask | stem_mask).astype(np.uint8)
+    seg_zyx = np.ascontiguousarray(seg.transpose(2, 1, 0))
+    seg_img = itk.image_from_array(seg_zyx)
+    seg_img.SetOrigin(origin)
+    seg_img.SetSpacing(spacing)
+    seg_img.SetDirection(itk.GetMatrixFromArray(np.array(direction)[:3, :3]))
+    itk.imwrite(seg_img, savedir / 'metal.nii.gz')
 
 
 if __name__ == '__main__':
-    b = argparse.BooleanOptionalAction
-    parser = argparse.ArgumentParser(description='Rectified Flow 推理脚本')
+    import tomlkit
 
-    parser.add_argument('--cond', type=str, required=True, help='术前条件图像路径 (.nii.gz)')
-    parser.add_argument('--save', type=str, required=True, help='生成结果保存目录')
+    cfg = Path('config.toml')
+    cfg = tomlkit.loads(cfg.read_text('utf-8')).unwrap()
 
-    parser.add_argument('--stem-brand', type=str, default=None, help='股骨柄型号')
-    parser.add_argument('--stem-size', type=str, default=None, help='股骨柄规格')
-    parser.add_argument('--cup-outer', type=float, default=None, help='髋臼杯外径')
-    parser.add_argument('--head-outer', type=float, default=None, help='股骨头外径')
-    parser.add_argument('--head-offset', type=float, default=None, help='股骨头偏距')
-    parser.add_argument('--liner-offset', type=float, default=None, help='内衬偏心距')
+    prl = list(cfg['test'].keys())[1]
+    pre_path = Path(cfg['train']['root']) / 'dataset' / 'pre' / f'{prl}.nii.gz'
 
-    parser.add_argument('--vae-pre', type=str, default=None, help='VAE模型路径')
-    parser.add_argument('--vae-metal', type=str, default=None, help='VAE模型路径')
-    parser.add_argument('--rflow', type=str, default=None, help='RFlow模型路径')
+    vae_pre, vae_metal, (rflow, context_embedder) = i1_load_models()
+    context_emb, context_emb_uncond = i2_context_embed(context_embedder)
+    pre_encoded, pre_origin, pre_spacing, pre_size, direction = i3_pre_encode(pre_path, *vae_pre)
+    metal_latent = i4_rflow_sample(rflow, context_emb, context_emb_uncond, pre_encoded)
+    cup, stem = i5_metal_decode(metal_latent, pre_size, *vae_metal)
+    i6_export('save_infer', cup, stem, pre_path, pre_origin, pre_spacing, direction)
 
-    parser.add_argument('--cpu', action='store_true', default=False, help='强制使用 CPU 推理')
-    parser.add_argument('--amp', action=b, default=True, help='是否启用混合精度')
-    parser.add_argument('--sw', type=int, default=4, help='滑动窗口推理时的并行 Batch Size')
-
-    parser.add_argument('--seed', type=int, default=None, help='随机种子')
-    parser.add_argument('--cfg', type=float, default=1.0, help='Guidance 权重')
-    parser.add_argument('--ts', type=int, default=5, help='采样步数')
-
-    args = parser.parse_args()
-
-    try:
-        main(
-            cond=args.cond,
-            save=args.save,
-            stem_brand=args.stem_brand,
-            stem_size=args.stem_size,
-            cup_outer=args.cup_outer,
-            head_outer=args.head_outer,
-            head_offset=args.head_offset,
-            liner_offset=args.liner_offset,
-            vae_pre=args.vae_pre,
-            vae_metal=args.vae_metal,
-            rflow=args.rflow,
-            cpu=args.cpu,
-            amp=args.amp,
-            sw=args.sw,
-            seed=args.seed,
-            cfg=args.cfg,
-            ts=args.ts,
-        )
-    except KeyboardInterrupt:
-        print('Keyboard interrupted terminating...')
+    print(pre_size, cup.shape, stem.shape)

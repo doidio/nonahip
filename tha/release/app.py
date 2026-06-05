@@ -1,6 +1,10 @@
 # uv run streamlit run release/app.py --server.port 8505 -- --config config.toml
 
 import argparse
+import gc
+import io
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import Literal
 
@@ -8,7 +12,20 @@ import itk
 import numpy as np
 import streamlit as st
 import tomlkit
-from infer import CUP_OUTER, FEMORAL, HEAD_OFFSET, HEAD_OUTER, LINER_OFFSET
+import torch
+from infer import (
+    CUP_OUTER,
+    FEMORAL,
+    HEAD_OFFSET,
+    HEAD_OUTER,
+    LINER_OFFSET,
+    i1_load_models,
+    i2_context_embed,
+    i3_pre_encode,
+    i4_rflow_sample,
+    i5_metal_decode,
+    i6_export,
+)
 
 st.set_page_config('Nonavox/THA', initial_sidebar_state='collapsed', layout='wide')
 st.markdown('### Nonavox/THA 假体预测生成')
@@ -51,32 +68,37 @@ def cache_load_pairs(config_file: str):
 
 
 def it_desc(it):
-    rt = [it['prl']]
+    label = []
 
     spec = it['context']['femoral_spec']
 
-    if len(spec[0]):
-        rt.append(f'型号: {spec[0]}')
+    if spec[0] is not None and len(str(spec[0])):
+        label.append(f'柄型号 {str(spec[0])}')
 
-    if len(spec[1]):
-        rt.append(f'规格: {spec[1]}')
+    if spec[1] is not None and len(str(spec[1])):
+        label.append(f'柄规格 {str(spec[1])}')
 
-    cup_outer = str(it['context'].get('cup_outer_best', it['context'].get('cup_outer', '')))
+    cup_outer = it['context'].get('cup_outer_best', it['context'].get('cup_outer'))
 
-    if len(cup_outer):
-        rt.append(f'杯径: {cup_outer}')
+    if cup_outer is not None and len(str(cup_outer)):
+        label.append(f'杯直径 {str(cup_outer)}')
 
-    liner_offset = str(it['context'].get('liner_offset_best', it['context'].get('liner_offset', '')))
+    liner_offset = it['context'].get('liner_offset_best', it['context'].get('liner_offset'))
 
-    if len(liner_offset):
-        rt.append(f'衬偏: {liner_offset}')
+    if liner_offset is not None and len(str(liner_offset)):
+        label.append(f'衬偏心 {str(liner_offset)}')
 
-    head_outer = str(it['context'].get('head_outer', ''))
+    head_outer = it['context'].get('head_outer')
 
-    if len(head_outer):
-        rt.append(f'头径: {head_outer}')
+    if head_outer is not None and len(str(head_outer)):
+        label.append(f'头直径 {str(head_outer)}')
 
-    return ' '.join(rt)
+    seed = it.get('seed')
+
+    if seed is not None and len(str(seed)):
+        label.append(f'种子 {str(seed)}')
+
+    return ' '.join(label)
 
 
 def fast_drr(a, ax, th=(0.05, 1.0), mode: Literal['mean', 'max'] = 'mean'):
@@ -200,6 +222,14 @@ elif (it := st.session_state.get('prl')) is None:
             images = []
             for i, f in enumerate((pre, post_align_hip, post_align_femur, cup, stem)):
                 img = itk.imread(f.as_posix())
+
+                if i == 0:
+                    pre_origin = list(itk.origin(img))
+                    pre_spacing = list(itk.spacing(img))
+                    pre_size = list(itk.size(img))
+                    pre_direction = itk.GetArrayFromMatrix(img.GetDirection())
+                    st.session_state['pre'] = pre_origin, pre_spacing, pre_size, pre_direction
+
                 img = itk.array_from_image(img).transpose(2, 1, 0)
                 if i >= 3:
                     img = np.where(img > 0.0, 1.0, 0.0)
@@ -216,13 +246,22 @@ elif (it := st.session_state.get('prl')) is None:
 else:
     cfg, tests = st.session_state['init']
     prl, pre, post_align_hip, post_align_femur, cup, stem = st.session_state['prl']
+    pre_origin, pre_spacing, pre_size, pre_direction = st.session_state['pre']
     it = tests[prl]
     desc = it_desc(it)
 
-    with st.expander(f'{desc}', expanded=False):
+    pre_path = Path(cfg['train']['root']) / 'dataset' / 'pre' / f'{prl}.nii.gz'
+
+    with st.expander(f'{prl} {desc}', expanded=False):
         st.code(tomlkit.dumps(it), 'toml')
 
-    cols = st.columns([2, 4, 1, 1])
+    cols = st.columns([1, 3])
+
+    top_cols = cols[1].columns([1, 1, 1, 1, 1, 1], vertical_alignment='bottom')
+    sub_cols = cols[1].columns([4, 1, 1])
+
+    stx = st.container()
+    log = st.expander('日志', expanded=True)
 
     canvas = {'术前': pre, '术后对齐骨盆': post_align_hip, '术后对齐股骨': post_align_femur}
     canvas_t = cols[0].radio('空间', list(canvas.keys()), horizontal=True)
@@ -232,56 +271,120 @@ else:
     ax_t = cols[0].radio('方位', list(ax.keys()), horizontal=True)
     ax = ax[ax_t]
 
-    render_t = cols[0].radio('渲染', ['透视', '断层', '三维'], horizontal=True)
-
-    metal = cols[0].radio('假体', ['真实术后', '预测生成'], horizontal=True)
+    render_t = cols[0].radio('渲染', ['透视', '断层', '三维（暂不支持）'], horizontal=True)
 
     cn = cols[0].number_input('列数', 1, 100, 10, 1, width=200)
 
-    if cols[1].checkbox('型号'):
-        spec_0 = cols[1].radio('型号', [_ for _ in FEMORAL.keys() if len(_)], horizontal=True, label_visibility='collapsed')
+    is_cond = False
 
-        if cols[1].checkbox('规格'):
-            spec_1 = cols[1].radio('规格', [_ for _ in FEMORAL[spec_0] if len(_)], horizontal=True, label_visibility='collapsed')
+    if sub_cols[0].checkbox('股骨柄型号'):
+        is_cond = True
+        stem_brand = sub_cols[0].radio('型号', [_ for _ in FEMORAL.keys() if len(_)], horizontal=True, label_visibility='collapsed')
+
+        if sub_cols[0].checkbox('股骨柄规格'):
+            stem_size = sub_cols[0].radio('规格', [_ for _ in FEMORAL[stem_brand] if len(_)], horizontal=True, label_visibility='collapsed')
         else:
-            spec_1 = None
+            stem_size = None
     else:
-        spec_0, spec_1 = None, None
+        stem_brand, stem_size = None, None
 
-    if cols[2].checkbox('杯径'):
-        cup_outer = cols[2].number_input('杯径', CUP_OUTER[0], CUP_OUTER[1], CUP_OUTER[2], CUP_OUTER[3])
+    if sub_cols[1].checkbox('杯直径'):
+        is_cond = True
+        cup_outer = sub_cols[1].number_input('杯直径', CUP_OUTER[0], CUP_OUTER[1], CUP_OUTER[2], CUP_OUTER[3], label_visibility='collapsed')
     else:
         cup_outer = None
 
-    if cols[2].checkbox('头径'):
-        head_outer = cols[2].number_input('头径', HEAD_OUTER[0], HEAD_OUTER[1], HEAD_OUTER[2], HEAD_OUTER[3])
+    if sub_cols[1].checkbox('头直径'):
+        is_cond = True
+        head_outer = sub_cols[1].number_input('头直径', HEAD_OUTER[0], HEAD_OUTER[1], HEAD_OUTER[2], HEAD_OUTER[3], label_visibility='collapsed')
     else:
         head_outer = None
 
-    if cols[3].checkbox('头偏'):
-        head_offset = cols[3].number_input('头偏', HEAD_OFFSET[0], HEAD_OFFSET[1], HEAD_OFFSET[2], HEAD_OFFSET[3])
+    if sub_cols[2].checkbox('头偏距'):
+        is_cond = True
+        head_offset = sub_cols[2].number_input('头偏距', HEAD_OFFSET[0], HEAD_OFFSET[1], HEAD_OFFSET[2], HEAD_OFFSET[3], label_visibility='collapsed')
     else:
         head_offset = None
 
-    if cols[3].checkbox('衬偏'):
-        liner_offset = cols[3].number_input('衬偏', LINER_OFFSET[0], LINER_OFFSET[1], LINER_OFFSET[2], LINER_OFFSET[3])
+    if sub_cols[2].checkbox('衬偏心'):
+        is_cond = True
+        liner_offset = sub_cols[2].number_input(
+            '衬偏心', LINER_OFFSET[0], LINER_OFFSET[1], LINER_OFFSET[2], LINER_OFFSET[3], label_visibility='collapsed'
+        )
     else:
         liner_offset = None
 
-    cols = st.columns([2, 2, 1, 1, 1, 1], vertical_alignment='bottom')
-
-    if cols[2].checkbox('可复现'):
-        seed = cols[3].number_input('随机种子', 0, None, 42, 1)
-        instances = 1
+    if top_cols[3].checkbox('可复现'):
+        seed = top_cols[2].number_input('复现种子', 0, None, 42, 1)
+        samples = 1
     else:
         seed = None
-        instances = cols[3].number_input('随机数量', 1, 100, 10, 1)
+        samples = top_cols[2].number_input('采样数量', 1, 100, 10, 1)
 
-    cfg_val = cols[4].number_input('CFG', 0.0, 9.0, 1.0, 1.0)
-    ts = cols[5].number_input('Timesteps', 1, 50, 5, 1)
+    timestemps = top_cols[4].number_input('采样步数 (Timesteps)', 1, 50, 5, 1)
+    cf_guidance = top_cols[5].number_input('无分类器引导 (Classifier-Free Guidance)', 0.0, 9.0, 1.0, 1.0)
 
-    if cols[1].button('生成', width='stretch'):
-        cond = Path(cfg['train']['root']) / 'dataset' / 'pre' / f'{prl}.nii.gz'
+    if top_cols[1].button('清空'):
+        del st.session_state['generated']
+        st.rerun()
+
+    if top_cols[0].button('条件生成' if is_cond else '无条件生成', width='stretch'):
+        desc = it_desc({
+            'prl': prl,
+            'context': {
+                'femoral_spec': [stem_brand, stem_size],
+                'cup_outer': cup_outer,
+                'head_outer': head_outer,
+                'head_offset': head_offset,
+                'liner_offset': liner_offset,
+            },
+            'seed': seed,
+        })
+
+        bar = stx.progress(0.0, '载入模型')
+        vae_pre, vae_metal, (rflow, context_embedder) = i1_load_models(printf=lambda *args: log.caption('\t'.join(str(_) for _ in args)))
+
+        bar.progress(0.2, '编码全局标签')
+        context_emb, context_emb_uncond = i2_context_embed(context_embedder, stem_brand, stem_size, cup_outer, head_outer, head_offset, liner_offset)
+
+        bar.progress(0.3, '编码术前图像')
+        pre_encoded, *_ = i3_pre_encode(pre_path, *vae_pre)
+
+        metal_latent = []
+        for _ in range(samples):
+            bar.progress(0.3 + 0.2 * (_ + 1) / samples, f'采样假体 {_ + 1} / {samples}')
+            metal_latent.append(i4_rflow_sample(rflow, context_emb, context_emb_uncond, pre_encoded, seed, timestemps, cf_guidance))
+
+        metal_tsdf = []
+        for _ in range(samples):
+            bar.progress(0.5 + 0.2 * (_ + 1) / samples, f'解码假体 {_ + 1} / {samples}')
+            metal_tsdf.append(i5_metal_decode(metal_latent[_], pre_size, *vae_metal))
+
+        bar.empty()
+
+        del vae_pre, vae_metal, rflow, context_embedder
+        del pre_encoded, metal_latent
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if 'generated' not in st.session_state:
+            st.session_state['generated'] = []
+
+        st.session_state['generated'].extend([(_, desc) for _ in metal_tsdf])
+
+    def format_func(i):
+        if i > 0:
+            (_, _), desc = generated[i - 1]
+            return f'预测 {i} {desc} '
+        else:
+            return '真实'
+
+    generated = st.session_state.get('generated', [])
+    metal_id = stx.radio('假体', range(len(generated) + 1), horizontal=True, format_func=format_func)
+
+    if metal_id > 0:
+        (cup, stem), desc = generated[metal_id - 1]
 
     if render_t == '透视':
         images = render_drr(prl, canvas_t, ax, canvas, cup, stem)
@@ -292,7 +395,37 @@ else:
     else:
         images = []
 
-    with st.expander(f'{canvas_t}{ax_t}{render_t}{metal}假体', expanded=True):
+    cols = stx.columns([2, 1, 1, 1, 1, 1, 1], vertical_alignment='bottom')
+
+    options = ['术前图像', '术前骨骼模型', '假体距离场', '假体模型']
+    selected = cols[0].multiselect('打包内容', options, options[-1], width='stretch')
+
+    if cols[1].button('导出', width='stretch'):
+        with cols[2].spinner('正在打包'):
+            with tempfile.TemporaryDirectory() as tempdir:
+                savedir = Path(tempdir) / '{}_{}'.format(prl, 'fake' if metal_id > 0 else 'true')
+                i6_export(savedir, cup, stem, pre_path, pre_origin, pre_spacing, pre_direction)
+
+                memory_file = io.BytesIO()
+                with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    if '术前图像' in selected:
+                        zf.write(pre_path, arcname='pre.nii.gz')
+
+                    if '术前骨骼模型' in selected:
+                        zf.write(savedir / 'pre.stl', arcname='pre.stl')
+
+                    if '假体距离场' in selected:
+                        zf.write(savedir / 'cup.nii.gz', arcname='cup.nii.gz')
+                        zf.write(savedir / 'stem.nii.gz', arcname='stem.nii.gz')
+
+                    if '假体模型' in selected:
+                        zf.write(savedir / 'cup.stl', arcname='cup.stl')
+                        zf.write(savedir / 'stem.stl', arcname='stem.stl')
+                        zf.write(savedir / 'metal.nii.gz', arcname='metal.nii.gz')
+
+            cols[2].download_button('下载', data=memory_file.getvalue(), file_name=f'{savedir.name}.zip', mime='application/zip')
+
+    with stx.expander(f'{canvas_t}{ax_t}{render_t}', expanded=True):
         for i in range(0, len(images), cn):
             cols = st.columns(cn)
             for j in range(cn):
