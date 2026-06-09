@@ -78,6 +78,10 @@ def _foreground_fn(x):
     return (x > -0.95).float()
 
 
+def _clamp_fn(x):
+    return torch.clamp(x, min=-1.0, max=1.0)
+
+
 def vae_train_transforms(patch_size, channels):
     # 设计妥协说明：
     # 离线数据生成已将 ROI 大小对齐填充为 32 的整数倍。
@@ -88,6 +92,7 @@ def vae_train_transforms(patch_size, channels):
     return [
         LoadImaged(keys=['image'], reader='ITKReader'),
         EnsureChannelFirstd(keys=['image'], channel_dim=-1 if channels > 1 else 'no_channel'),
+        Lambdad(keys=['image'], func=_clamp_fn),
         SpatialPadd(keys=['image'], spatial_size=patch_size, constant_values=-1.0),
         CopyItemsd(keys=['image'], times=1, names=['label']),
         Lambdad(keys=['label'], func=_foreground_fn),
@@ -108,6 +113,7 @@ def vae_val_transforms(patch_size, channels):
     return [
         LoadImaged(keys=['image'], reader='ITKReader'),
         EnsureChannelFirstd(keys=['image'], channel_dim=-1 if channels > 1 else 'no_channel'),
+        Lambdad(keys=['image'], func=_clamp_fn),
         SpatialPadd(keys=['image'], spatial_size=patch_size, constant_values=-1.0),
     ]
 

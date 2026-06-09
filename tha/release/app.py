@@ -207,11 +207,11 @@ elif (it := st.session_state.get('prl')) is None:
         st.warning('测试集为空')
         st.stop()
 
-    prl = st.selectbox('测试集', list(sorted(tests.keys())), format_func=lambda _: it_desc(tests[_]))
+    prl = st.selectbox('测试集', list(sorted(tests.keys())), format_func=lambda _: f'{_} {it_desc(tests[_])}')
 
     dataset = Path(cfg['train']['root']) / 'dataset'
 
-    if st.button('载入'):
+    if st.button('载入', width=200):
         with st.spinner('正在载入', show_time=True):
             pre = dataset / 'pre' / f'{prl}.nii.gz'
             post_align_hip = dataset / 'post_align_hip' / f'{prl}.nii.gz'
@@ -398,7 +398,7 @@ else:
     cols = stx.columns([2, 1, 1, 1, 1, 1, 1], vertical_alignment='bottom')
 
     options = ['术前图像', '术前骨骼模型', '假体距离场', '假体模型']
-    selected = cols[0].multiselect('打包内容', options, options[-1], width='stretch')
+    selected = cols[0].multiselect('打包', options, options[-1], width='stretch')
 
     if cols[1].button('导出', width='stretch'):
         with cols[2].spinner('正在打包'):

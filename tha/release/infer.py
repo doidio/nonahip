@@ -8,7 +8,7 @@ import torch
 from monai.inferers import sliding_window_inference
 from monai.networks.nets import AutoencoderKL, DiffusionModelUNet
 from monai.networks.schedulers import RFlowScheduler
-from monai.transforms import CenterSpatialCrop, Compose, DivisiblePadd, EnsureChannelFirstd, LoadImaged, SpatialPadd
+from monai.transforms import CenterSpatialCrop, Compose, DivisiblePadd, EnsureChannelFirstd, Lambdad, LoadImaged, SpatialPadd
 from torch import autocast
 
 FEMORAL = {
@@ -530,6 +530,7 @@ def i3_pre_encode(pre_path, vae_model, scale_factor, mean, channels, sw_batch_si
     transforms = Compose([
         LoadImaged(keys=['image'], reader='ITKReader'),
         EnsureChannelFirstd(keys=['image'], channel_dim=-1 if channels > 1 else 'no_channel'),
+        Lambdad(keys=['image'], func=lambda x: torch.clamp(x, min=-1.0, max=1.0)),
         SpatialPadd(keys=['image'], spatial_size=(128, 128, 128), constant_values=-1.0),
         DivisiblePadd(keys=['image'], k=16, constant_values=-1.0),
     ])

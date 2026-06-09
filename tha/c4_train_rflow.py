@@ -326,11 +326,13 @@ def main():
                 # 1. 10% 概率全局全部丢弃
                 global_drop_mask = (cfg_rand < 0.10).float()
 
-                # Image Cond: 运用 Global Drop
-                cond = cond * (1.0 - global_drop_mask.view(current_bs, 1, 1, 1, 1))
+                # Image Cond: 独立随机丢弃 (10% 概率)
+                cond_ind_drop_mask = (torch.rand(current_bs, 1, device=device) < 0.10).float()
+                # 联合 Mask: 如果 global drop 则为 0，否则应用独立 drop
+                cond = cond * (1.0 - global_drop_mask.view(current_bs, 1, 1, 1, 1)) * (1.0 - cond_ind_drop_mask.view(current_bs, 1, 1, 1, 1))
 
-                # Context Cond: 独立随机丢弃 (每个 Token 5% 概率)
-                ind_drop_mask = (torch.rand(current_bs, 6, device=device) < 0.05).float()
+                # Context Cond: 独立随机丢弃 (每个 Token 10% 概率)
+                ind_drop_mask = (torch.rand(current_bs, 6, device=device) < 0.10).float()
 
                 # 联合 Mask: 如果 global drop 则为 0，否则应用独立 drop
                 current_masks = masks * (1.0 - global_drop_mask) * (1.0 - ind_drop_mask)

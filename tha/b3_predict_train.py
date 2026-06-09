@@ -262,9 +262,16 @@ def preload(cfg: dict, it: dict):
     # 快照
     stack = []
     axis = 1  # 冠状面投影
-    for image in (pre_image, *post_images, hip_image, femur_image):
+
+    # 针对 CT 图像（范围 -2.0 到 1.0，+2.0 后 0.0 为空气将被丢弃）
+    for image in (pre_image, *post_images):
+        img = fast_drr(image + 2.0, axis, th=(0.0, 3.0), mode='mean')
+        img = np.flipud(img.transpose(1, 0, 2))
+        stack.append(img)
+
+    # 针对假体 SDF（范围 -1.0 到 1.0，+1.0 后 0.0 为外部背景将被丢弃）
+    for image in (hip_image, femur_image):
         img = fast_drr(image + 1.0, axis, th=(0.0, 2.0), mode='mean')
-        # 转置并翻转，确保解剖方位正确（Superior 在上）
         img = np.flipud(img.transpose(1, 0, 2))
         stack.append(img)
 
@@ -303,6 +310,7 @@ def launch(config_file: str, max_workers: int):
 
     # 按股骨柄型号抽取验证集和测试集
     if len(cfg.get('val', [])) == 0 and len(cfg.get('test', [])) == 0:
+        val_n, test_n = 10, 10  # 每种股骨柄的验证集和测试集数量上限
         stem = {}
         for prl, it in pairs.items():
             if it.get('excluded', False):
@@ -318,14 +326,14 @@ def launch(config_file: str, max_workers: int):
 
         trains, vals, tests = {}, {}, {}
         for spec, ls in stem.items():
-            for _ in range(10):
+            for _ in range(val_n):
                 if len(ls):
                     trains[ls.pop()] = spec
 
                 if len(ls):
                     vals[ls.pop()] = spec
 
-                if len(ls) and _ < 3:
+                if len(ls) and _ < test_n:
                     tests[ls.pop()] = spec
 
         cfg['val'] = vals

@@ -319,16 +319,20 @@ def resample_ab(
 
 @wp.func
 def bone_normalize(ct_value: float) -> float:
-    if 150.0 <= ct_value < 650.0:
+    if -1000.0 <= ct_value < 0.0:  # 空气
+        value = -2.0 + (ct_value - 0.0) / 1000.0 * 0.5
+    elif 0.0 <= ct_value < 150.0:  # 水到软组织
+        value = -1.5 + (ct_value - 0.0) / 150.0 * 0.5
+    elif 150.0 <= ct_value < 650.0:  # 松质骨到皮质骨
         value = -1.0 + (ct_value - 150.0) / 500.0 * 1.0
-    elif 650.0 <= ct_value < 1150.0:
+    elif 650.0 <= ct_value < 1150.0:  # 皮质骨
         value = 0.0 + (ct_value - 650.0) / 500.0 * 0.5
-    elif 1150.0 <= ct_value < 3150.0:
+    elif 1150.0 <= ct_value < 3150.0:  # 皮质骨到金属
         value = 0.5 + (ct_value - 1150.0) / 2000.0 * 0.5
     elif ct_value >= 3150.0:
         value = 1.0
     else:
-        value = -1.0
+        value = -2.0
     return value
 
 
