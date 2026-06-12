@@ -146,10 +146,34 @@ def main():
         scaler_d = None
 
     # 日志
-    suffix = datetime.now().strftime(f'{task}_{subtask}_%Y%m%d_%H%M%S')
     if resume:
-        suffix += '_resume'
-    log_dir = log_dir / suffix
+        candidates = []
+        if log_dir.exists():
+            for p in log_dir.iterdir():
+                if p.is_dir() and p.name.startswith(f'{task}_{subtask}_'):
+                    candidates.append(p)
+        if candidates:
+            # 根据目录名中的时间戳排序 (如 vae_metal_20260609_160842)
+            prefix = f'{task}_{subtask}_'
+            def get_sort_key(p):
+                name = p.name
+                if name.startswith(prefix):
+                    ts = name[len(prefix):len(prefix)+15]
+                    parts = ts.split('_')
+                    if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 8 and parts[1].isdigit() and len(parts[1]) == 6:
+                        return (ts, name)
+                return ('', p.name)
+            candidates.sort(key=get_sort_key)
+            log_dir = candidates[-1]
+            print('Resuming logs in:\t', log_dir)
+        else:
+            suffix = datetime.now().strftime(f'{task}_{subtask}_%Y%m%d_%H%M%S_resume')
+            log_dir = log_dir / suffix
+            print('No existing log directory found for resume. Creating:\t', log_dir)
+    else:
+        suffix = datetime.now().strftime(f'{task}_{subtask}_%Y%m%d_%H%M%S')
+        log_dir = log_dir / suffix
+
     writer = SummaryWriter(log_dir=log_dir.as_posix())
 
     saver = SaveImage(

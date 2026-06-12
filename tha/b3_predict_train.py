@@ -296,7 +296,7 @@ def main(cfg: dict, it: dict):
     import gc
 
     gc.collect()
-    time.sleep(0.5)  # 短暂休眠以确保资源释放完毕
+    time.sleep(0.5)
 
 
 def launch(config_file: str, max_workers: int):
@@ -308,9 +308,9 @@ def launch(config_file: str, max_workers: int):
     #     main(cfg, pairs[_])
     # return
 
-    # 按股骨柄型号抽取验证集和测试集
+    # 共 1483 例，排除 92 例，训练集 1224 例，验证集 84 例，测试集 83 例，每种股骨柄型号的验证集和测试集数量均匀且最多 10 例
+    val_n, test_n = 10, 10
     if len(cfg.get('val', [])) == 0 and len(cfg.get('test', [])) == 0:
-        val_n, test_n = 10, 10  # 每种股骨柄的验证集和测试集数量上限
         stem = {}
         for prl, it in pairs.items():
             if it.get('excluded', False):
