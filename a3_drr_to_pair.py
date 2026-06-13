@@ -23,8 +23,8 @@ cfg_path = Path(args.config)
 cfg = tomlkit.loads(cfg_path.read_text('utf-8')).unwrap()
 client = Minio(**cfg['minio']['client'])
 
-st.set_page_config('Nonavox/THA', initial_sidebar_state='collapsed')
-st.markdown('### Nonavox/THA 术前术后配对')
+st.set_page_config('Nonahip', initial_sidebar_state='collapsed')
+st.markdown('### Nonahip 术前术后配对')
 
 if (it := st.session_state.get('ud')) is None:
     with st.spinner('初始化', show_time=True):  # noqa
@@ -86,12 +86,10 @@ elif (it := st.session_state.get('pid')) is None:
                     client.fget_object('drr', f'{object_name}/{f.name}', f.as_posix())
                     info = tomlkit.loads(f.read_text('utf-8')).unwrap()
 
-                    if any(
-                        (
-                            'DERIVED' in info['dicom']['ImageType'],
-                            'SECONDARY' in info['dicom']['ImageType'],
-                        )
-                    ):
+                    if any((
+                        'DERIVED' in info['dicom']['ImageType'],
+                        'SECONDARY' in info['dicom']['ImageType'],
+                    )):
                         continue
 
                     f = Path(tdir) / 'axial.png'

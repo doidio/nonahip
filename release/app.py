@@ -27,8 +27,8 @@ from infer import (
     i6_export,
 )
 
-st.set_page_config('Nonavox/THA', initial_sidebar_state='collapsed', layout='wide')
-st.markdown('### Nonavox/THA 假体预测生成')
+st.set_page_config('Nonahip', initial_sidebar_state='collapsed', layout='wide')
+st.markdown('### Nonahip 假体预测生成')
 
 
 # @st.cache_resource(show_spinner=False)

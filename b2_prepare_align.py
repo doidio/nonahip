@@ -23,8 +23,8 @@ def cache_load_pairs(config_file: str):
 
 save_key = 'hip_align'
 
-st.set_page_config('Nonavox/THA', initial_sidebar_state='collapsed', layout='wide')
-st.markdown('### Nonavox/THA 术前术后配准')
+st.set_page_config('Nonahip', initial_sidebar_state='collapsed', layout='wide')
+st.markdown('### Nonahip 术前术后配准')
 
 # --- 第一阶段：初始化与数据列表加载 ---
 if (it := st.session_state.get('init')) is None:
@@ -200,9 +200,7 @@ else:
 
             # 避开金属假体的距离
             _ = saved.get(part, {}).get('d_metal', 5 if part in ('femur',) else 15)
-            d_metal: int = st.number_input(
-                f'{part_name}采样点远离金属（0 ~ 50 mm）', 0, 50, _, step=5, key=f'{part}_d_metal'
-            )
+            d_metal: int = st.number_input(f'{part_name}采样点远离金属（0 ~ 50 mm）', 0, 50, _, step=5, key=f'{part}_d_metal')
 
             with st.spinner(_ := '采样', show_time=True):
                 max_dist = float(np.linalg.norm(sizes[1] * spacings[1]))
@@ -323,9 +321,7 @@ else:
                 pre_mesh: trimesh.Trimesh = bone_meshes[part][0].copy()
                 pre_mesh.apply_transform(np.linalg.inv(matrix))  # 将术前网格逆变换到术后坐标系对比
                 pl.add_mesh(pre_mesh, color='lightyellow')  # type: ignore
-                pl.add_points(
-                    vertices, color='crimson', render_points_as_spheres=True, point_size=3
-                )  # 实际采样点（深红）
+                pl.add_points(vertices, color='crimson', render_points_as_spheres=True, point_size=3)  # 实际采样点（深红）
 
                 pl.camera_position = 'xz'
                 pl.reset_camera(bounds=b.T.flatten())  # type: ignore

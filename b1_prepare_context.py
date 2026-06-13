@@ -28,8 +28,8 @@ def cache_load_pairs(config_file: str):
 
 save_key = 'head_center'
 
-st.set_page_config('Nonavox/THA', initial_sidebar_state='collapsed', layout='wide')
-st.markdown('### Nonavox/THA 全局标签录入')
+st.set_page_config('Nonahip', initial_sidebar_state='collapsed', layout='wide')
+st.markdown('### Nonahip 全局标签录入')
 
 # --- 第一阶段：初始化与数据列表加载 ---
 if (it := st.session_state.get('init')) is None:
@@ -313,9 +313,7 @@ else:
         sphere_directions = np.column_stack((x, y, z)).tolist()
 
         liner_offset_best: float = (
-            st.session_state.get('liner_offset_best', saved.get('liner_offset', 0.0))
-            if step > 0.25
-            else saved.get('liner_offset', 0.0)
+            st.session_state.get('liner_offset_best', saved.get('liner_offset', 0.0)) if step > 0.25 else saved.get('liner_offset', 0.0)
         )
         occ_max = get_occupancy(head_center, cup_axis, liner_offset_best)
 
@@ -393,9 +391,7 @@ else:
     _ = 'liner_offset_best'
     st.session_state[_] = st.session_state.get(_, saved.get(_, saved.get('liner_offset', 0.0)))
 
-    liner_offset: float = liner_slot.number_input(
-        '内衬偏心距', 0.0, 6.0, step=0.25, format='%.2f', key='liner_offset_best'
-    )
+    liner_offset: float = liner_slot.number_input('内衬偏心距', 0.0, 6.0, step=0.25, format='%.2f', key='liner_offset_best')
 
     cup_center = head_center - liner_offset * cup_axis
 

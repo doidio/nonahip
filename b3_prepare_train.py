@@ -21,8 +21,8 @@ def cache_load_pairs(config_file: str):
 
 save_key = 'train_ready'
 
-st.set_page_config('Nonavox/THA', initial_sidebar_state='collapsed', layout='wide')
-st.markdown('### Nonavox/THA 训练集检视')
+st.set_page_config('Nonahip', initial_sidebar_state='collapsed', layout='wide')
+st.markdown('### Nonahip 训练集检视')
 
 if (it := st.session_state.get('init')) is None:
     with st.spinner('初始化', show_time=True):
