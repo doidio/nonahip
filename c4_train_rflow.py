@@ -177,12 +177,17 @@ def main():
     scaler = GradScaler() if use_amp else None
 
     start_epoch = 0
-    rflow_ckpt_path = (ckpt_dir / f'{task}_last.pt').resolve()
 
-    if args.resume and rflow_ckpt_path.exists():
+    # 继续训练
+    if args.resume:
+        load_pt = (ckpt_dir / f'{task}_last.pt').resolve()
+    else:
+        load_pt = None
+
+    if load_pt and load_pt.exists():
         try:
-            print('Resuming:\t', rflow_ckpt_path)
-            ckpt = torch.load(rflow_ckpt_path, map_location=device)
+            print('Resuming:\t', load_pt)
+            ckpt = torch.load(load_pt, map_location=device)
             rflow.load_state_dict(ckpt['rflow_state'])
 
             if 'context_state' in ckpt:
@@ -215,12 +220,37 @@ def main():
             print('MSE:\t', val_loss)
             start_epoch += 1
         except Exception as e:
-            print(f'Load failed: {e}')
+            raise SystemError(f'Load failed: {e}')
 
-    suffix = datetime.now().strftime(f'{task}_%Y%m%d_%H%M%S')
+    # 日志
     if args.resume:
-        suffix += '_resume'
-    log_dir = log_dir / suffix
+        candidates = []
+        if log_dir.exists():
+            for p in log_dir.iterdir():
+                if p.is_dir() and p.name.startswith(f'{task}_'):
+                    candidates.append(p)
+        if candidates:
+            # 根据目录名中的时间戳排序 (如 rflow_20260609_160842)
+            prefix = f'{task}_'
+            def get_sort_key(p):
+                name = p.name
+                if name.startswith(prefix):
+                    ts = name[len(prefix):len(prefix)+15]
+                    parts = ts.split('_')
+                    if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 8 and parts[1].isdigit() and len(parts[1]) == 6:
+                        return (ts, name)
+                return ('', p.name)
+            candidates.sort(key=get_sort_key)
+            log_dir = candidates[-1]
+            print('Resuming logs in:\t', log_dir)
+        else:
+            suffix = datetime.now().strftime(f'{task}_%Y%m%d_%H%M%S_resume')
+            log_dir = log_dir / suffix
+            print('No existing log directory found for resume. Creating:\t', log_dir)
+    else:
+        suffix = datetime.now().strftime(f'{task}_%Y%m%d_%H%M%S')
+        log_dir = log_dir / suffix
+
     writer = SummaryWriter(log_dir=log_dir.as_posix())
 
     saver = SaveImage(
