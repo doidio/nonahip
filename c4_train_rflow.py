@@ -1,13 +1,13 @@
 import argparse
+import json
+import random
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
-import define
 import numpy as np
 import tomlkit
 import torch
-from kernel import fast_drr
 from monai.data import DataLoader, Dataset
 from monai.inferers import sliding_window_inference
 from monai.transforms import Compose, SaveImage
@@ -15,6 +15,10 @@ from PIL import Image
 from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from transformers import AutoModel, AutoTokenizer
+
+import define
+from kernel import fast_drr
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -48,7 +52,6 @@ def main():
         lr,
         effective_batch_size,
         ema_decay,
-        classifier_free_guidance,
     ) = [
         cfg['train'][task][_]
         for _ in (
@@ -60,7 +63,6 @@ def main():
             'lr',
             'effective_batch_size',
             'ema_decay',
-            'classifier_free_guidance',
         )
     ]
 
@@ -167,12 +169,24 @@ def main():
     embed_dim = 256
     rflow = define.rflow_unet(context_embedding_size=embed_dim).to(device)
     context_embedder = define.ContextEmbedder(embed_dim=embed_dim).to(device)
+    param_head = define.ParameterVelocityHead().to(device)
     rflow_ema = define.EMA(rflow, decay=ema_decay)
     context_ema = define.EMA(context_embedder, decay=ema_decay)
+    param_ema = define.EMA(param_head, decay=ema_decay)
+
+    print('Loading Sentence-PubMedBERT...')
+    model_dir = cfg['pretrained']['text_encoder']
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    text_encoder = AutoModel.from_pretrained(model_dir).to(device)
+    text_encoder.eval()
+    for param in text_encoder.parameters():
+        param.requires_grad = False
 
     scheduler = define.scheduler_rflow()
 
-    optimizer = torch.optim.AdamW(list(rflow.parameters()) + list(context_embedder.parameters()), lr=lr, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(
+        list(rflow.parameters()) + list(context_embedder.parameters()) + list(param_head.parameters()), lr=lr, weight_decay=1e-5
+    )
 
     scaler = GradScaler() if use_amp else None
 
@@ -194,6 +208,10 @@ def main():
                 print('Loading ContextEmbedder...')
                 context_embedder.load_state_dict(ckpt['context_state'])
 
+            if 'param_state' in ckpt:
+                print('Loading ParameterVelocityHead...')
+                param_head.load_state_dict(ckpt['param_state'])
+
             optimizer.load_state_dict(ckpt['optimizer'])
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
@@ -205,6 +223,9 @@ def main():
 
             if 'context_state_ema' in ckpt:
                 context_ema.load_state_dict(ckpt['context_state_ema'])
+
+            if 'param_state_ema' in ckpt:
+                param_ema.load_state_dict(ckpt['param_state_ema'])
 
             if use_amp and 'scaler' in ckpt:
                 scaler.load_state_dict(ckpt['scaler'])
@@ -232,14 +253,16 @@ def main():
         if candidates:
             # 根据目录名中的时间戳排序 (如 rflow_20260609_160842)
             prefix = f'{task}_'
+
             def get_sort_key(p):
                 name = p.name
                 if name.startswith(prefix):
-                    ts = name[len(prefix):len(prefix)+15]
+                    ts = name[len(prefix) : len(prefix) + 15]
                     parts = ts.split('_')
                     if len(parts) == 2 and parts[0].isdigit() and len(parts[0]) == 8 and parts[1].isdigit() and len(parts[1]) == 6:
                         return (ts, name)
                 return ('', p.name)
+
             candidates.sort(key=get_sort_key)
             log_dir = candidates[-1]
             print('Resuming logs in:\t', log_dir)
@@ -306,11 +329,11 @@ def main():
         # Losses are scaled by effective_batch_size during accumulation; rescale
         # the tail step so a partial final micro-batch still becomes a true mean.
         tail_scale = effective_batch_size / accumulated_count
-        for param in list(rflow.parameters()) + list(context_embedder.parameters()):
+        for param in list(rflow.parameters()) + list(context_embedder.parameters()) + list(param_head.parameters()):
             if param.grad is not None:
                 param.grad *= tail_scale
 
-        torch.nn.utils.clip_grad_norm_(list(rflow.parameters()) + list(context_embedder.parameters()), 1.0)
+        torch.nn.utils.clip_grad_norm_(list(rflow.parameters()) + list(context_embedder.parameters()) + list(param_head.parameters()), 1.0)
 
         if use_amp:
             scale_before = scaler.get_scale()
@@ -325,12 +348,14 @@ def main():
         if not step_skipped:
             rflow_ema.update(rflow)
             context_ema.update(context_embedder)
+            param_ema.update(param_head)
 
         optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(start_epoch, num_epochs):
         rflow.train()
         context_embedder.train()
+        param_head.train()
         epoch_loss = 0
         step = 0
 
@@ -339,62 +364,102 @@ def main():
         for batch in pbar:
             step += 1
 
-            # batch 经过 pad_list_data_collate，全部是 Tensor
             image = batch['image'].to(device, non_blocking=True)
             cond = batch['condition'].to(device, non_blocking=True)
-            brand_id = batch['brand_id'].to(device, non_blocking=True)
-            size_id = batch['size_id'].to(device, non_blocking=True)
-            numerics = batch['numerics'].to(device, non_blocking=True)
-            masks = batch['masks'].to(device, non_blocking=True)
-
             current_bs = image.shape[0]
 
+            c_text_strs_true = []
+            c_text_strs_cond = []
+
+            for i in range(current_bs):
+                prob = random.random()
+
+                ctx_str = batch['ctx_raw'][i] if 'ctx_raw' in batch else '{}'
+                ctx = json.loads(ctx_str)
+                true_text = define.generate_text(ctx, level='full')
+                c_text_strs_true.append(true_text)
+
+                if prob < 1 / 6:
+                    # 1/6: Drop Both (p(y,c))
+                    cond[i] = 0.0
+                    c_text_strs_cond.append('')
+                elif prob < 2 / 6:
+                    # 1/6: Drop c only (p(y,c|x))
+                    c_text_strs_cond.append('')
+                elif prob < 3 / 6:
+                    # 1/6: Drop x only (p(y,c|c_full))
+                    cond[i] = 0.0
+                    c_text_strs_cond.append(true_text)
+                elif prob < 4 / 6:
+                    # 1/6: Partial c - Model only (p(y,c|x, c_model))
+                    c_text_strs_cond.append(define.generate_text(ctx, level='model'))
+                elif prob < 5 / 6:
+                    # 1/6: Partial c - Model & Size (p(y,c|x, c_model_size))
+                    c_text_strs_cond.append(define.generate_text(ctx, level='model_size'))
+                else:
+                    # 1/6: Keep Both (p(y,c|x, c_full))
+                    c_text_strs_cond.append(true_text)
+
+            # Encode true texts
+            tokens_true = tokenizer(c_text_strs_true, return_tensors='pt', padding=True, truncation=True, max_length=128).to(device)
+            # Encode condition texts
+            tokens_cond = tokenizer(c_text_strs_cond, return_tensors='pt', padding=True, truncation=True, max_length=128).to(device)
+
+            with torch.no_grad():
+                # Process true texts
+                outputs_true = text_encoder(**tokens_true)
+                attn_mask_true = tokens_true['attention_mask']
+                token_embs_true = outputs_true.last_hidden_state
+                input_mask_true = attn_mask_true.unsqueeze(-1).expand(token_embs_true.size()).float()
+                c_text_true = torch.sum(token_embs_true * input_mask_true, 1) / torch.clamp(input_mask_true.sum(1), min=1e-9)
+
+                # Process cond texts
+                outputs_cond = text_encoder(**tokens_cond)
+                attn_mask_cond = tokens_cond['attention_mask']
+                token_embs_cond = outputs_cond.last_hidden_state
+                input_mask_cond = attn_mask_cond.unsqueeze(-1).expand(token_embs_cond.size()).float()
+                c_text_cond = torch.sum(token_embs_cond * input_mask_cond, 1) / torch.clamp(input_mask_cond.sum(1), min=1e-9)
+
             with amp_ctx:
-                # CFG 策略: 互斥的分支，支持 Batched
-                cfg_rand = torch.rand(current_bs, 1, device=device)
-
-                # 1. 10% 概率全局全部丢弃
-                global_drop_mask = (cfg_rand < 0.10).float()
-
-                # Image Cond: 独立随机丢弃 (10% 概率)
-                cond_ind_drop_mask = (torch.rand(current_bs, 1, device=device) < 0.10).float()
-                # 联合 Mask: 如果 global drop 则为 0，否则应用独立 drop
-                cond = cond * (1.0 - global_drop_mask.view(current_bs, 1, 1, 1, 1)) * (1.0 - cond_ind_drop_mask.view(current_bs, 1, 1, 1, 1))
-
-                # Context Cond: 独立随机丢弃 (每个 Token 10% 概率)
-                ind_drop_mask = (torch.rand(current_bs, 6, device=device) < 0.10).float()
-
-                # 联合 Mask: 如果 global drop 则为 0，否则应用独立 drop
-                current_masks = masks * (1.0 - global_drop_mask) * (1.0 - ind_drop_mask)
-
-                # 生成全局条件 Embeddings [B, 6, C]
-                context = context_embedder(brand_id, size_id, numerics, current_masks)
-
                 # 采样时间步
                 timesteps = scheduler.sample_timesteps(image)
 
+                # 获取加噪比例
+                t_val = (timesteps.float() / scheduler.num_train_timesteps).view(-1, 1).to(device)
+
                 # 设计妥协说明：移除了 valid_mask。因为训练数据已在离线对齐 32 整数倍，且 batch_size = 1，无批次内 padding。
-                noise = torch.randn_like(image)
+                noise_y = torch.randn_like(image)
 
                 # RFM 加噪过程
-                noisy_image = scheduler.add_noise(original_samples=image, noise=noise, timesteps=timesteps)
+                noisy_image = scheduler.add_noise(original_samples=image, noise=noise_y, timesteps=timesteps)
+
+                # 联合加噪过程 (条件加噪使用 c_text_cond)
+                noise_c = torch.randn_like(c_text_cond)
+                c_t = t_val * c_text_cond + (1.0 - t_val) * noise_c
+
+                # 生成全局条件 Embeddings [B, 6, C]
+                context = context_embedder(c_t)
 
                 # 拼接输入 (Image + Pre-op Condition)
                 input_tensor = torch.cat([noisy_image, cond], dim=1)
 
                 # 预测速度 (Velocity), 注入 Context
-                velocity_pred = rflow(x=input_tensor, timesteps=timesteps, context=context)
+                velocity_y_pred = rflow(x=input_tensor, timesteps=timesteps, context=context)
+                velocity_c_pred = param_head(x=input_tensor, timesteps=timesteps)
 
-                # RFM 的目标是真实数据与噪声的差: target_velocity = image - noise
-                target_velocity = image - noise
+                # 计算目标速度 (预测真实的 c_text_true)
+                target_velocity_y = image - noise_y
+                target_velocity_c = c_text_true - noise_c
 
-                # 设计妥协说明：移除了 valid_mask。由于每个 batch 大小恒为 1 且无 dynamic padding，直接计算均值 MSE 即可。
-                raw_mse = torch.nn.functional.mse_loss(velocity_pred.float(), target_velocity.float(), reduction='mean')
+                # 联合损失函数计算
+                loss_y = torch.nn.functional.mse_loss(velocity_y_pred.float(), target_velocity_y.float(), reduction='mean')
+                loss_c = torch.nn.functional.mse_loss(velocity_c_pred.float(), target_velocity_c.float(), reduction='mean')
 
-                # 记录原始 MSE 用于监控和打印
-                display_loss = raw_mse.item()
-
-                loss = raw_mse
+                # 将两者简单相加，纯粹是为了让 PyTorch 能在一次 backward() 中同时向两个完全独立的网络派发梯度，提升计算效率，数值本身无物理意义
+                loss = loss_y + loss_c
+                display_loss = loss.item()
+                disp_loss_y = loss_y.item()
+                disp_loss_c = loss_c.item()
 
                 # 动态梯度累积缩放 (根据当前真实 bs 与期望有效 bs 的比例缩放 loss)
                 micro_loss = loss * (current_bs / effective_batch_size)
@@ -414,9 +479,11 @@ def main():
 
             if step % 1 == 0:
                 global_step = epoch * len(train_loader) + step
-                writer.add_scalar('train/loss', display_loss, global_step)
+                writer.add_scalar('train/loss_total', display_loss, global_step)
+                writer.add_scalar('train/loss_y', disp_loss_y, global_step)
+                writer.add_scalar('train/loss_c', disp_loss_c, global_step)
 
-            pbar.set_postfix({'MSE': f'{display_loss:.4f}'})
+            pbar.set_postfix({'loss': f'{display_loss:.4f}', 'loss_y': f'{disp_loss_y:.4f}', 'loss_c': f'{disp_loss_c:.4f}'})
 
         # Flush the final partial accumulation before validation/checkpointing.
         if accumulated_samples > 0:
@@ -429,12 +496,16 @@ def main():
         if epoch % val_interval == 0:
             rflow.eval()
             context_embedder.eval()
+            param_head.eval()
             rflow_ema.store(rflow)
             rflow_ema.copy_to(rflow)
             context_ema.store(context_embedder)
             context_ema.copy_to(context_embedder)
+            param_ema.store(param_head)
+            param_ema.copy_to(param_head)
 
-            val_loss = 0
+            val_loss_y_sum = 0
+            val_loss_c_sum = 0
             val_steps = 0
 
             with torch.no_grad():
@@ -442,28 +513,46 @@ def main():
                     image = batch['image'].to(device)
                     cond = batch['condition'].to(device)
 
-                    brand_id = batch['brand_id'].to(device)
-                    size_id = batch['size_id'].to(device)
-                    numerics = batch['numerics'].to(device)
-                    masks = batch['masks'].to(device)
+                    ctx_raw = batch['ctx_raw']
+                    c_text_strs = []
+                    for i in range(image.shape[0]):
+                        ctx_str = batch['ctx_raw'][i] if 'ctx_raw' in batch else '{}'
+                        ctx = json.loads(ctx_str)
+                        c_text_strs.append(define.generate_text(ctx, level='full'))
 
-                    # 生成全局条件 Embeddings
-                    context = context_embedder(brand_id, size_id, numerics, masks)
+                    tokens = tokenizer(c_text_strs, return_tensors='pt', padding=True, truncation=True, max_length=128).to(device)
+                    with torch.no_grad():
+                        outputs = text_encoder(**tokens)
+                        attn_mask = tokens['attention_mask']
+                        token_embs = outputs.last_hidden_state
+                        input_mask = attn_mask.unsqueeze(-1).expand(token_embs.size()).float()
+                        c_text = torch.sum(token_embs * input_mask, 1) / torch.clamp(input_mask.sum(1), min=1e-9)
 
                     timesteps = scheduler.sample_timesteps(image)
+                    t_val = (timesteps.float() / scheduler.num_train_timesteps).view(-1, 1).to(device)
+
                     # 设计妥协说明：验证亦移除 valid_mask
-                    noise = torch.randn_like(image)
-                    noisy_image = scheduler.add_noise(original_samples=image, noise=noise, timesteps=timesteps)
+                    noise_y = torch.randn_like(image)
+                    noisy_image = scheduler.add_noise(original_samples=image, noise=noise_y, timesteps=timesteps)
+
+                    noise_c = torch.randn_like(c_text)
+                    c_t = t_val * c_text + (1.0 - t_val) * noise_c
+
+                    context = context_embedder(c_t)
                     input_tensor = torch.cat([noisy_image, cond], dim=1)
 
                     with amp_ctx:
-                        velocity_pred = rflow(input_tensor, timesteps, context=context)
-                        target_velocity = image - noise
+                        velocity_y_pred = rflow(input_tensor, timesteps, context=context)
+                        velocity_c_pred = param_head(input_tensor, timesteps)
 
-                        # 设计妥协说明：直接计算均值 MSE
-                        loss = torch.nn.functional.mse_loss(velocity_pred.float(), target_velocity.float(), reduction='mean')
+                        target_velocity_y = image - noise_y
+                        target_velocity_c = c_text - noise_c
 
-                    val_loss += loss.item()
+                        loss_y = torch.nn.functional.mse_loss(velocity_y_pred.float(), target_velocity_y.float(), reduction='mean')
+                        loss_c = torch.nn.functional.mse_loss(velocity_c_pred.float(), target_velocity_c.float(), reduction='mean')
+
+                    val_loss_y_sum += loss_y.item()
+                    val_loss_c_sum += loss_c.item()
                     val_steps += 1
 
                     prl = batch['prl'][0]
@@ -477,30 +566,24 @@ def main():
                         generator = torch.Generator(device=device).manual_seed(42)
                         # 设计妥协说明：移除 valid_mask 遮罩
                         generated = torch.randn(image.shape, device=device, generator=generator)
-
-                        # Pre-compute constant inputs for generation loop to save overhead
-                        uncond = torch.zeros_like(cond)
-                        cond_input = torch.cat([cond, uncond])
-
-                        # CFG for context: (Cond Context, Uncond Context)
-                        uncond_context = context_embedder(brand_id, size_id, numerics, torch.zeros_like(masks))
-                        context_input = torch.cat([context, uncond_context])
+                        generated_c = torch.randn(c_text.shape, device=device, generator=generator)
 
                         for t, next_t in zip(all_timesteps, all_next_timesteps):
                             val_bar.set_postfix({'RFlow': t.item()})
 
-                            latent_input = torch.cat([generated] * 2)
-                            model_input = torch.cat([latent_input, cond_input], dim=1)
-
                             with torch.no_grad(), amp_ctx:  # 使用 AMP 保护以减少显存占用并加速推理
-                                t_input = t[None].to(device).repeat(2)
-                                velocity_pred_batch = rflow(model_input, t_input, context=context_input)
+                                t_input = t[None].to(device)
 
-                            velocity_cond, velocity_uncond = velocity_pred_batch.chunk(2)
-                            velocity_pred = velocity_uncond + classifier_free_guidance * (velocity_cond - velocity_uncond)
+                                # 联合生成中 c_t 已具备引导作用，无需无条件路径
+                                current_context = context_embedder(generated_c)
+                                model_input = torch.cat([generated, cond], dim=1)
+
+                                velocity_y_pred = rflow(model_input, t_input, context=current_context)
+                                velocity_c_pred = param_head(model_input, t_input)
 
                             with torch.no_grad():
-                                generated, _ = scheduler.step(velocity_pred, t, generated, next_t)
+                                generated, _ = scheduler.step(velocity_y_pred, t, generated, next_t)
+                                generated_c, _ = scheduler.step(velocity_c_pred, t, generated_c, next_t)
 
                         val_bar.set_postfix({})
 
@@ -547,9 +630,11 @@ def main():
 
             rflow_ema.restore(rflow)
             context_ema.restore(context_embedder)
-            avg_val_loss = val_loss / val_steps
-            writer.add_scalar('val/loss', avg_val_loss, epoch)
-            print('Val Loss:\t', avg_val_loss)
+            avg_val_loss_y = val_loss_y_sum / val_steps
+            avg_val_loss_c = val_loss_c_sum / val_steps
+            writer.add_scalar('val/loss_y', avg_val_loss_y, epoch)
+            writer.add_scalar('val/loss_c', avg_val_loss_c, epoch)
+            print(f'Val Loss Y:\t {avg_val_loss_y:.4f} | Val Loss C:\t {avg_val_loss_c:.4f}')
 
             ckpt = {
                 'epoch': epoch,
@@ -557,8 +642,11 @@ def main():
                 'rflow_state_ema': rflow_ema.state_dict(),
                 'context_state': context_embedder.state_dict(),
                 'context_state_ema': context_ema.state_dict(),
+                'param_state': param_head.state_dict(),
+                'param_state_ema': param_ema.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
+                'val_loss_y': avg_val_loss_y,
+                'val_loss_c': avg_val_loss_c,
             }
             if use_amp:
                 ckpt['scaler'] = scaler.state_dict()

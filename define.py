@@ -1,8 +1,8 @@
+import json
 from copy import deepcopy
 
 import numpy as np
 import torch
-from b0_preload_prothesis import FEMORAL
 from monai.losses import PerceptualLoss
 from monai.networks.nets import AutoencoderKL, DiffusionModelUNet, PatchDiscriminator
 from monai.networks.schedulers import RFlowScheduler
@@ -161,61 +161,66 @@ class ScaleLatentd(MapTransform):
         return d
 
 
+def generate_text(ctx, level='full'):
+    """
+    Generate dense K-V string from context.
+    Levels:
+    - 'full': keep all parameters
+    - 'model_size': keep only Femoral Model and Size
+    - 'model': keep only Femoral Model
+    """
+    if not ctx:
+        return ''
+
+    parts = []
+
+    femoral_spec = ctx.get('femoral_spec', [])
+    if len(femoral_spec) >= 1:
+        if level in ['full', 'model_size']:
+            if len(femoral_spec) == 2:
+                parts.append(f'Femoral Model: {femoral_spec[0]}, Size: {femoral_spec[1]}')
+            else:
+                parts.append(f'Femoral Model: {femoral_spec[0]}')
+        elif level == 'model':
+            parts.append(f'Femoral Model: {femoral_spec[0]}')
+
+    if level == 'full':
+        head_outer = ctx.get('head_outer')
+        if head_outer is not None:
+            parts.append(f'Head Diameter: {head_outer} mm')
+
+        head_offset = ctx.get('head_offset')
+        if head_offset is not None:
+            parts.append(f'Head Offset: {head_offset} mm')
+
+        cup_outer = ctx.get('cup_outer')
+        if cup_outer is not None:
+            parts.append(f'Cup Diameter: {cup_outer} mm')
+
+        liner_material = ctx.get('liner_material')
+        if liner_material is not None:
+            parts.append(f'Liner Material: {liner_material}')
+
+        liner_offset = ctx.get('liner_offset')
+        if liner_offset is not None:
+            parts.append(f'Liner Offset: {liner_offset} mm')
+
+    return ' | '.join(parts)
+
+
 class PrepareContextd(MapTransform):
-    """提取 TOML 中的手术设计参数并转换为 Tensor"""
+    """提取 TOML 中的手术设计参数并保留为原始字典"""
 
     def __init__(self, keys, allow_missing_keys=False):
         super().__init__(keys, allow_missing_keys)
-        self.brands = sorted(list(FEMORAL.keys()))
-        self.brand_to_id = {b: i for i, b in enumerate(self.brands)}
-
-        all_sizes = set()
-        for v in FEMORAL.values():
-            all_sizes.update(v)
-        self.sizes = sorted(list(all_sizes))
-        self.size_to_id = {s: i for i, s in enumerate(self.sizes)}
 
     def __call__(self, data):
         d = dict(data)
+
         ctx = d.get('context', {})
+        d['ctx_raw'] = json.dumps(ctx)
 
-        # femoral_spec = ["Brand", "Size"]
-        spec = ctx.get('femoral_spec', ['', ''])
-        brand = spec[0] if len(spec) > 0 else ''
-        size = spec[1] if len(spec) > 1 else ''
-
-        brand_id = self.brand_to_id.get(brand, 0)
-        brand_mask = 1.0 if brand in self.brand_to_id else 0.0
-
-        size_id = self.size_to_id.get(size, 0)
-        size_mask = 1.0 if size in self.size_to_id else 0.0
-
-        # Numerics: [cup_outer, head_outer, head_offset, liner_offset]
-        # 使用 Min-Max 归一化到 [-1, 1] 范围，提高对极端条件的鲁棒性
-        def min_max_scale(val, min_val, max_val):
-            if val is None or val == '':
-                return 0.0, 0.0
-            # 线性映射 [min, max] -> [-1, 1]
-            return 2.0 * (float(val) - min_val) / (max_val - min_val) - 1.0, 1.0
-
-        cup_outer = ctx['cup_outer_best'] if 'cup_outer_best' in ctx else ctx.get('cup_outer')
-        head_outer = ctx.get('head_outer')
-        head_offset = ctx.get('head_offset')
-        liner_offset = ctx['liner_offset_best'] if 'liner_offset_best' in ctx else ctx.get('liner_offset')
-
-        cup_outer_val, cup_outer_mask = min_max_scale(cup_outer, 38.0, 62.0)
-        head_outer_val, head_outer_mask = min_max_scale(head_outer, 22.0, 44.0)
-        head_offset_val, head_offset_mask = min_max_scale(head_offset, -5.0, 9.0)
-        liner_offset_val, liner_offset_mask = min_max_scale(liner_offset, 0.0, 6.0)
-
-        nums = [cup_outer_val, head_outer_val, head_offset_val, liner_offset_val]
-        masks = [brand_mask, size_mask, cup_outer_mask, head_outer_mask, head_offset_mask, liner_offset_mask]
-
-        d['brand_id'] = torch.tensor(brand_id, dtype=torch.long)
-        d['size_id'] = torch.tensor(size_id, dtype=torch.long)
-        d['numerics'] = torch.tensor(nums, dtype=torch.float32)
-        d['masks'] = torch.tensor(masks, dtype=torch.float32)
-
+        # 默认这里不再预先生成 c_text，因为训练时会在每个 batch 内动态生成
         d.pop('context', None)
 
         return d
@@ -236,43 +241,46 @@ def rflow_transforms(image_mean, image_sf, cond_mean, cond_sf):
 
 
 class ContextEmbedder(torch.nn.Module):
-    """将手术设计参数编码为全局条件向量序列 [B, 6, C]"""
+    """将带噪参数 c_t 映射为 UNet 交叉注意力 Token 的模态桥梁"""
 
     def __init__(self, embed_dim=256):
         super().__init__()
-        brands = sorted(list(FEMORAL.keys()))
-        all_sizes = set()
-        for v in FEMORAL.values():
-            all_sizes.update(v)
-        sizes = sorted(list(all_sizes))
+        # 初始化一个 3 层 MLP
+        self.mlp = torch.nn.Sequential(torch.nn.Linear(768, 1024), torch.nn.SiLU(), torch.nn.Linear(1024, 1536))
 
-        self.brand_emb = torch.nn.Embedding(len(brands), embed_dim)
-        self.size_emb = torch.nn.Embedding(len(sizes), embed_dim)
-
-        # 为每个数值参数配置独立的投影层
-        self.cup_outer_proj = torch.nn.Linear(1, embed_dim)
-        self.head_outer_proj = torch.nn.Linear(1, embed_dim)
-        self.head_offset_proj = torch.nn.Linear(1, embed_dim)
-        self.liner_offset_proj = torch.nn.Linear(1, embed_dim)
-
-    def forward(self, brand_id, size_id, numerics, masks=None):
-        brand_embed = self.brand_emb(brand_id)  # [B, C]
-        size_embed = self.size_emb(size_id)  # [B, C]
-
-        # 分解并投影数值参数
-        cup_outer_embed = self.cup_outer_proj(numerics[:, 0:1])  # [B, C]
-        head_outer_embed = self.head_outer_proj(numerics[:, 1:2])  # [B, C]
-        head_offset_embed = self.head_offset_proj(numerics[:, 2:3])  # [B, C]
-        liner_offset_embed = self.liner_offset_proj(numerics[:, 3:4])  # [B, C]
-
-        # 堆叠成序列，共 6 个 Token [B, 6, C]
-        # 注意顺序: brand, size, cup_outer, head_outer, head_offset, liner_offset
-        out = torch.stack([brand_embed, size_embed, cup_outer_embed, head_outer_embed, head_offset_embed, liner_offset_embed], dim=1)
-
-        if masks is not None:
-            out = out * masks.unsqueeze(-1)
-
+    def forward(self, c_t):
+        # c_t Shape: [B, 768]
+        x = self.mlp(c_t)
+        # 返回形状为 [B, 6, 256] 的 context_tokens
+        out = x.view(x.shape[0], 6, 256)
         return out
+
+
+class ParameterVelocityHead(torch.nn.Module):
+    """预测参数速度 v_c 的轻量级模块"""
+
+    def __init__(self, in_channels=12):
+        super().__init__()
+        self.conv = torch.nn.Sequential(
+            torch.nn.Conv3d(in_channels, 32, kernel_size=3, stride=2, padding=1),
+            torch.nn.GroupNorm(8, 32),
+            torch.nn.SiLU(),
+            torch.nn.Conv3d(32, 64, kernel_size=3, stride=2, padding=1),
+            torch.nn.GroupNorm(16, 64),
+            torch.nn.SiLU(),
+            torch.nn.Conv3d(64, 128, kernel_size=3, stride=2, padding=1),
+            torch.nn.GroupNorm(32, 128),
+            torch.nn.SiLU(),
+        )
+        self.pool = torch.nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.time_proj = torch.nn.Sequential(torch.nn.Linear(1, 128), torch.nn.SiLU())
+        self.fc = torch.nn.Linear(128, 768)
+
+    def forward(self, x, timesteps):
+        feat = self.conv(x)
+        feat = self.pool(feat).view(x.shape[0], -1)  # [B, 128]
+        t_emb = self.time_proj(timesteps.view(-1, 1).float())
+        return self.fc(feat + t_emb)
 
 
 def rflow_unet(context_embedding_size=256):

@@ -41,6 +41,9 @@ excluded = [
 [dataset]
 root = "/config/workspace/public-hdd/dataset-tha"
 
+[pretrained]
+text_encoder = "/config/workspace/public-hdd/pretrained/S-PubMedBert-MS-MARCO"
+
 [train]
 root = "/config/workspace/public-ssd/train-tha"
 
@@ -72,7 +75,6 @@ effective_batch_size = 48
 sw_batch_size = 12
 lr = 0.0001
 ema_decay = 0.999
-classifier_free_guidance = 3.0
 
 [val]
 3239892_L = "Stryker Accolade TMZF"
