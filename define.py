@@ -172,37 +172,44 @@ def generate_text(ctx, level='full'):
     if not ctx:
         return ''
 
+    def has_value(x):
+        return x is not None and x != ''
+
     parts = []
 
     femoral_spec = ctx.get('femoral_spec', [])
-    if len(femoral_spec) >= 1:
+    femoral_model = femoral_spec[0] if len(femoral_spec) >= 1 and has_value(femoral_spec[0]) else None
+    femoral_size = femoral_spec[1] if len(femoral_spec) >= 2 and has_value(femoral_spec[1]) else None
+    if femoral_model:
         if level in ['full', 'model_size']:
-            if len(femoral_spec) == 2:
-                parts.append(f'Femoral Model: {femoral_spec[0]}, Size: {femoral_spec[1]}')
+            if femoral_size:
+                parts.append(f'Femoral Model: {femoral_model}, Size: {femoral_size}')
             else:
-                parts.append(f'Femoral Model: {femoral_spec[0]}')
+                parts.append(f'Femoral Model: {femoral_model}')
         elif level == 'model':
-            parts.append(f'Femoral Model: {femoral_spec[0]}')
+            parts.append(f'Femoral Model: {femoral_model}')
 
     if level == 'full':
         head_outer = ctx.get('head_outer')
-        if head_outer is not None:
+        if has_value(head_outer):
             parts.append(f'Head Diameter: {head_outer} mm')
 
         head_offset = ctx.get('head_offset')
-        if head_offset is not None:
+        if has_value(head_offset):
             parts.append(f'Head Offset: {head_offset} mm')
 
-        cup_outer = ctx.get('cup_outer')
-        if cup_outer is not None:
+        cup_outer = ctx.get('cup_outer_best')
+        if not has_value(cup_outer):
+            cup_outer = ctx.get('cup_outer')
+        if has_value(cup_outer):
             parts.append(f'Cup Diameter: {cup_outer} mm')
 
         liner_material = ctx.get('liner_material')
-        if liner_material is not None:
+        if has_value(liner_material):
             parts.append(f'Liner Material: {liner_material}')
 
         liner_offset = ctx.get('liner_offset')
-        if liner_offset is not None:
+        if has_value(liner_offset):
             parts.append(f'Liner Offset: {liner_offset} mm')
 
     return ' | '.join(parts)
@@ -279,7 +286,7 @@ class ParameterVelocityHead(torch.nn.Module):
     def forward(self, x, timesteps):
         feat = self.conv(x)
         feat = self.pool(feat).view(x.shape[0], -1)  # [B, 128]
-        t_emb = self.time_proj(timesteps.view(-1, 1).float())
+        t_emb = self.time_proj(timesteps.view(-1, 1).float() / 1000.0)
         return self.fc(feat + t_emb)
 
 

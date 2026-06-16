@@ -356,7 +356,8 @@ def main():
         rflow.train()
         context_embedder.train()
         param_head.train()
-        epoch_loss = 0
+        epoch_loss_y = 0
+        epoch_loss_c = 0
         step = 0
 
         pbar = tqdm(train_loader, desc=f'Epoch {epoch}/{num_epochs - 1}')
@@ -457,7 +458,6 @@ def main():
 
                 # 将两者简单相加，纯粹是为了让 PyTorch 能在一次 backward() 中同时向两个完全独立的网络派发梯度，提升计算效率，数值本身无物理意义
                 loss = loss_y + loss_c
-                display_loss = loss.item()
                 disp_loss_y = loss_y.item()
                 disp_loss_c = loss_c.item()
 
@@ -475,22 +475,23 @@ def main():
                 optimizer_step(accumulated_samples)
                 accumulated_samples = 0
 
-            epoch_loss += display_loss
+            epoch_loss_y += disp_loss_y
+            epoch_loss_c += disp_loss_c
 
             if step % 1 == 0:
                 global_step = epoch * len(train_loader) + step
-                writer.add_scalar('train/loss_total', display_loss, global_step)
                 writer.add_scalar('train/loss_y', disp_loss_y, global_step)
                 writer.add_scalar('train/loss_c', disp_loss_c, global_step)
 
-            pbar.set_postfix({'loss': f'{display_loss:.4f}', 'loss_y': f'{disp_loss_y:.4f}', 'loss_c': f'{disp_loss_c:.4f}'})
+            pbar.set_postfix({'loss_y': f'{disp_loss_y:.4f}', 'loss_c': f'{disp_loss_c:.4f}'})
 
         # Flush the final partial accumulation before validation/checkpointing.
         if accumulated_samples > 0:
             optimizer_step(accumulated_samples)
             accumulated_samples = 0
 
-        writer.add_scalar('train/epoch_loss', epoch_loss / step, epoch)
+        writer.add_scalar('train/epoch_loss_y', epoch_loss_y / step, epoch)
+        writer.add_scalar('train/epoch_loss_c', epoch_loss_c / step, epoch)
 
         # 验证与采样 (保持 BS=1，不需要改 collate_fn)
         if epoch % val_interval == 0:
@@ -506,6 +507,8 @@ def main():
 
             val_loss_y_sum = 0
             val_loss_c_sum = 0
+            val_cos_sim_v_sum = 0
+            val_cos_sim_vt_sum = 0
             val_steps = 0
 
             with torch.no_grad():
@@ -513,7 +516,6 @@ def main():
                     image = batch['image'].to(device)
                     cond = batch['condition'].to(device)
 
-                    ctx_raw = batch['ctx_raw']
                     c_text_strs = []
                     for i in range(image.shape[0]):
                         ctx_str = batch['ctx_raw'][i] if 'ctx_raw' in batch else '{}'
@@ -554,6 +556,29 @@ def main():
                     val_loss_y_sum += loss_y.item()
                     val_loss_c_sum += loss_c.item()
                     val_steps += 1
+
+                    # 瞬时预测 c_data：基于 Flow Matching 的常微分方程式闭式解 (无需 50 步积分)
+                    c_pred = c_t + (1.0 - t_val) * velocity_c_pred
+                    batch_cos_sim_v = torch.nn.functional.cosine_similarity(c_pred, c_text, dim=1).mean().item()
+                    val_cos_sim_v_sum += batch_cos_sim_v
+
+                    # 50步精确评估 param_head (使用真实 y_t 轨迹)
+                    with torch.no_grad():
+                        scheduler.set_timesteps(num_inference_steps=50)
+                        temp_timesteps = scheduler.timesteps.to(device)
+                        temp_next_timesteps = torch.cat([temp_timesteps[1:], torch.zeros(1, dtype=temp_timesteps.dtype, device=device)])
+
+                        c_t_pred = torch.randn_like(c_text, generator=torch.Generator(device=device).manual_seed(42 + i))
+
+                        for t_s, next_t_s in zip(temp_timesteps, temp_next_timesteps):
+                            t_val_s = (t_s.float() / scheduler.num_train_timesteps).view(-1, 1).to(device)
+                            y_t_s = t_val_s * image + (1.0 - t_val_s) * noise_y
+                            with amp_ctx:
+                                v_c_pred_s = param_head(torch.cat([y_t_s, cond], dim=1), t_s[None].to(device).repeat(image.shape[0]))
+                            c_t_pred, _ = scheduler.step(v_c_pred_s, t_s, c_t_pred, next_t_s)
+
+                    batch_cos_sim_vt = torch.nn.functional.cosine_similarity(c_t_pred, c_text, dim=1).mean().item()
+                    val_cos_sim_vt_sum += batch_cos_sim_vt
 
                     prl = batch['prl'][0]
                     if prl == val_prl:
@@ -630,11 +655,18 @@ def main():
 
             rflow_ema.restore(rflow)
             context_ema.restore(context_embedder)
-            avg_val_loss_y = val_loss_y_sum / val_steps
-            avg_val_loss_c = val_loss_c_sum / val_steps
-            writer.add_scalar('val/loss_y', avg_val_loss_y, epoch)
-            writer.add_scalar('val/loss_c', avg_val_loss_c, epoch)
-            print(f'Val Loss Y:\t {avg_val_loss_y:.4f} | Val Loss C:\t {avg_val_loss_c:.4f}')
+            val_loss_y_avg = val_loss_y_sum / val_steps
+            val_loss_c_avg = val_loss_c_sum / val_steps
+            val_cos_sim_v_avg = val_cos_sim_v_sum / val_steps
+            val_cos_sim_vt_avg = val_cos_sim_vt_sum / val_steps
+            writer.add_scalar('val/loss_y', val_loss_y_avg, epoch)
+            writer.add_scalar('val/loss_c', val_loss_c_avg, epoch)
+            writer.add_scalar('val/c_cossim_v', val_cos_sim_v_avg, epoch)
+            writer.add_scalar('val/c_cossim_vt', val_cos_sim_vt_avg, epoch)
+
+            print(
+                f'Val Loss Y: {val_loss_y_avg:11.4f} | Val Loss C: {val_loss_c_avg:11.4f} | Val CosSim(V): {val_cos_sim_v_avg:11.4f} | Val CosSim(Vt): {val_cos_sim_vt_avg:11.4f}'
+            )
 
             ckpt = {
                 'epoch': epoch,
@@ -645,8 +677,8 @@ def main():
                 'param_state': param_head.state_dict(),
                 'param_state_ema': param_ema.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'val_loss_y': avg_val_loss_y,
-                'val_loss_c': avg_val_loss_c,
+                'val_loss_y': val_loss_y_avg,
+                'val_loss_c': val_loss_c_avg,
             }
             if use_amp:
                 ckpt['scaler'] = scaler.state_dict()
