@@ -1,6 +1,7 @@
 import argparse
 import json
 import random
+import sys
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +37,7 @@ def main():
 
     config_path = Path(args.config)
     cfg = tomlkit.loads(config_path.read_text('utf-8')).unwrap()
+    progress_enabled = sys.stderr.isatty()
 
     train_root = Path(str(cfg['train']['root']))
     dataset_root = Path(cfg['dataset']['root'])
@@ -191,24 +193,26 @@ def main():
             input_mask = attn_mask.unsqueeze(-1).expand(token_embs.size()).float()
             return torch.sum(token_embs * input_mask, 1) / torch.clamp(input_mask.sum(1), min=1e-9)
 
-    print('Fitting PubMedBERT embedding normalizer...')
-    train_texts = [define.generate_text(it['context'], level='full') for it in train_files]
-    normalizer_texts = []
-    for it in train_files:
-        ctx = it['context']
-        full_text = define.generate_text(ctx, level='full')
-        normalizer_texts.extend(['', '', full_text, full_text, define.generate_text(ctx, level='model'), define.generate_text(ctx, level='model_size')])
-    normalizer_embeddings = []
-    with torch.no_grad():
-        for i in tqdm(range(0, len(normalizer_texts), 64), desc='TextNorm'):
-            normalizer_embeddings.append(encode_texts(normalizer_texts[i : i + 64]).cpu())
-        text_normalizer = define.TextEmbeddingNormalizer.fit(torch.cat(normalizer_embeddings, dim=0), shrinkage=0.005, eps=1e-4).to(device)
-        train_full_embeddings = []
-        for i in range(0, len(train_texts), 64):
-            train_full_embeddings.append(encode_texts(train_texts[i : i + 64]).cpu())
-        train_full_embeddings = torch.cat(train_full_embeddings, dim=0).to(device)
-        c_noise_scale = torch.linalg.vector_norm(text_normalizer(train_full_embeddings), dim=1).mean() / (train_full_embeddings.shape[1] ** 0.5)
-    print('Parameter noise scale:\t', float(c_noise_scale))
+    def fit_text_normalizer():
+        print('Fitting PubMedBERT embedding normalizer...')
+        train_texts = [define.generate_text(it['context'], level='full') for it in train_files]
+        normalizer_texts = []
+        for it in train_files:
+            ctx = it['context']
+            full_text = define.generate_text(ctx, level='full')
+            normalizer_texts.extend(['', '', full_text, full_text, define.generate_text(ctx, level='model'), define.generate_text(ctx, level='model_size')])
+        normalizer_embeddings = []
+        with torch.no_grad():
+            for i in tqdm(range(0, len(normalizer_texts), 64), desc='TextNorm', disable=not progress_enabled):
+                normalizer_embeddings.append(encode_texts(normalizer_texts[i : i + 64]).cpu())
+            normalizer = define.TextEmbeddingNormalizer.fit(torch.cat(normalizer_embeddings, dim=0), shrinkage=0.005, eps=1e-4).to(device)
+            train_full_embeddings = []
+            for i in range(0, len(train_texts), 64):
+                train_full_embeddings.append(encode_texts(train_texts[i : i + 64]).cpu())
+            train_full_embeddings = torch.cat(train_full_embeddings, dim=0).to(device)
+            noise_scale = torch.linalg.vector_norm(normalizer(train_full_embeddings), dim=1).mean() / (train_full_embeddings.shape[1] ** 0.5)
+        print('Parameter noise scale:\t', float(noise_scale))
+        return normalizer, noise_scale
 
     scheduler = define.scheduler_rflow()
 
@@ -226,6 +230,9 @@ def main():
     else:
         load_pt = None
 
+    text_normalizer = None
+    c_noise_scale = None
+
     if load_pt and load_pt.exists():
         try:
             print('Resuming:\t', load_pt)
@@ -240,12 +247,13 @@ def main():
                 print('Loading ParameterVelocityHead...')
                 param_head.load_state_dict(ckpt['param_state'])
 
-            if 'text_normalizer' in ckpt:
-                print('Loading TextEmbeddingNormalizer...')
-                text_normalizer.load_state_dict(ckpt['text_normalizer'])
-            if 'c_noise_scale' in ckpt:
-                c_noise_scale = torch.as_tensor(ckpt['c_noise_scale'], device=device)
-                print('Parameter noise scale:\t', float(c_noise_scale))
+            if 'text_normalizer' not in ckpt or 'c_noise_scale' not in ckpt:
+                raise RuntimeError('Checkpoint lacks text_normalizer or c_noise_scale and is incompatible with normalized parameter training.')
+            print('Loading TextEmbeddingNormalizer...')
+            state = ckpt['text_normalizer']
+            text_normalizer = define.TextEmbeddingNormalizer(state['mean'], state['whitening'], state['coloring']).to(device)
+            c_noise_scale = torch.as_tensor(ckpt['c_noise_scale'], device=device)
+            print('Parameter noise scale:\t', float(c_noise_scale))
 
             optimizer.load_state_dict(ckpt['optimizer'])
             for param_group in optimizer.param_groups:
@@ -277,6 +285,8 @@ def main():
             start_epoch += 1
         except Exception as e:
             raise SystemError(f'Load failed: {e}')
+    else:
+        text_normalizer, c_noise_scale = fit_text_normalizer()
 
     # 日志
     if args.resume:
@@ -395,7 +405,7 @@ def main():
         epoch_loss_c = 0
         step = 0
 
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch}/{num_epochs - 1}')
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch}/{num_epochs - 1}', disable=not progress_enabled)
 
         for batch in pbar:
             step += 1
@@ -502,7 +512,8 @@ def main():
                 writer.add_scalar('train/loss_y', disp_loss_y, global_step)
                 writer.add_scalar('train/loss_c', disp_loss_c, global_step)
 
-            pbar.set_postfix({'loss_y': f'{disp_loss_y:.4f}', 'loss_c': f'{disp_loss_c:.4f}'})
+            if progress_enabled:
+                pbar.set_postfix({'loss_y': f'{disp_loss_y:.4f}', 'loss_c': f'{disp_loss_c:.4f}'})
 
         # Flush the final partial accumulation before validation/checkpointing.
         if accumulated_samples > 0:
@@ -528,12 +539,10 @@ def main():
             val_loss_c_sum = 0
             val_cos_sim_v_sum = 0
             val_cos_sim_vt_sum = 0
-            val_cos_sim_v_raw_sum = 0
-            val_cos_sim_vt_raw_sum = 0
             val_steps = 0
 
             with torch.no_grad():
-                for val_idx, batch in enumerate(val_bar := tqdm(val_loader, desc='Val')):
+                for val_idx, batch in enumerate(val_bar := tqdm(val_loader, desc='Val', disable=not progress_enabled)):
                     image = batch['image'].to(device)
                     cond = batch['condition'].to(device)
 
@@ -544,8 +553,7 @@ def main():
                         c_text_strs.append(define.generate_text(ctx, level='full'))
 
                     with torch.no_grad():
-                        c_text_raw = encode_texts(c_text_strs)
-                        c_text = text_normalizer(c_text_raw)
+                        c_text = text_normalizer(encode_texts(c_text_strs))
 
                     timesteps = scheduler.sample_timesteps(image)
                     t_val = (timesteps.float() / scheduler.num_train_timesteps).view(-1, 1).to(device)
@@ -578,8 +586,6 @@ def main():
                     c_pred = c_t + (1.0 - t_val) * velocity_c_pred
                     batch_cos_sim_v = torch.nn.functional.cosine_similarity(c_pred, c_text, dim=1).mean().item()
                     val_cos_sim_v_sum += batch_cos_sim_v
-                    batch_cos_sim_v_raw = torch.nn.functional.cosine_similarity(text_normalizer.denormalize(c_pred), c_text_raw, dim=1).mean().item()
-                    val_cos_sim_v_raw_sum += batch_cos_sim_v_raw
 
                     # 50步精确评估 param_head：从随机 c_t 出发，沿真实 y_t 轨迹积分到 c_data。
                     with torch.no_grad():
@@ -598,8 +604,6 @@ def main():
 
                     batch_cos_sim_vt = torch.nn.functional.cosine_similarity(c_t_pred, c_text, dim=1).mean().item()
                     val_cos_sim_vt_sum += batch_cos_sim_vt
-                    batch_cos_sim_vt_raw = torch.nn.functional.cosine_similarity(text_normalizer.denormalize(c_t_pred), c_text_raw, dim=1).mean().item()
-                    val_cos_sim_vt_raw_sum += batch_cos_sim_vt_raw
 
                     prl = batch['prl'][0]
                     if prl == val_prl:
@@ -615,7 +619,8 @@ def main():
                         generated_c = torch.randn(c_text.shape, device=device, generator=generator) * c_noise_scale
 
                         for t, next_t in zip(all_timesteps, all_next_timesteps):
-                            val_bar.set_postfix({'RFlow': t.item()})
+                            if progress_enabled:
+                                val_bar.set_postfix({'RFlow': t.item()})
 
                             with torch.no_grad(), amp_ctx:  # 使用 AMP 保护以减少显存占用并加速推理
                                 t_input = t[None].to(device)
@@ -630,7 +635,8 @@ def main():
                                 generated, _ = scheduler.step(velocity_y_pred, t, generated, next_t)
                                 generated_c, _ = scheduler.step(velocity_c_pred, t, generated_c, next_t)
 
-                        val_bar.set_postfix({})
+                        if progress_enabled:
+                            val_bar.set_postfix({})
 
                         with amp_ctx:
                             vis_generated = decode(generated, f'{name}_val_epoch_{epoch:03d}_Gen', vae_image, image_sf, image_mean, epoch)
@@ -680,19 +686,14 @@ def main():
             val_loss_c_avg = val_loss_c_sum / val_steps
             val_cos_sim_v_avg = val_cos_sim_v_sum / val_steps
             val_cos_sim_vt_avg = val_cos_sim_vt_sum / val_steps
-            val_cos_sim_v_raw_avg = val_cos_sim_v_raw_sum / val_steps
-            val_cos_sim_vt_raw_avg = val_cos_sim_vt_raw_sum / val_steps
             writer.add_scalar('val/loss_y', val_loss_y_avg, epoch)
             writer.add_scalar('val/loss_c', val_loss_c_avg, epoch)
             writer.add_scalar('val/c_cossim_v', val_cos_sim_v_avg, epoch)
             writer.add_scalar('val/c_cossim_vt', val_cos_sim_vt_avg, epoch)
-            writer.add_scalar('val/c_cossim_v_raw', val_cos_sim_v_raw_avg, epoch)
-            writer.add_scalar('val/c_cossim_vt_raw', val_cos_sim_vt_raw_avg, epoch)
 
             print(
                 f'Val Loss Y: {val_loss_y_avg:11.4f} | Val Loss C: {val_loss_c_avg:11.4f} | '
-                f'Val CosSim(V): {val_cos_sim_v_avg:11.4f} | Val CosSim(Vt): {val_cos_sim_vt_avg:11.4f} | '
-                f'Raw CosSim(V): {val_cos_sim_v_raw_avg:11.4f} | Raw CosSim(Vt): {val_cos_sim_vt_raw_avg:11.4f}'
+                f'Val CosSim(V): {val_cos_sim_v_avg:11.4f} | Val CosSim(Vt): {val_cos_sim_vt_avg:11.4f}'
             )
 
             ckpt = {
@@ -710,8 +711,6 @@ def main():
                 'val_loss_c': val_loss_c_avg,
                 'val_c_cossim_v': val_cos_sim_v_avg,
                 'val_c_cossim_vt': val_cos_sim_vt_avg,
-                'val_c_cossim_v_raw': val_cos_sim_v_raw_avg,
-                'val_c_cossim_vt_raw': val_cos_sim_vt_raw_avg,
             }
             if use_amp:
                 ckpt['scaler'] = scaler.state_dict()
