@@ -164,12 +164,12 @@ flowchart TB
   param_eval_vt{{验证假体参数轨迹演化能力}}
 
   %% 参数预测头评估
-  param_flow --->|参数单步回推| param_eval_v
+  param_flow --->|单步回推| param_eval_v
   
   c_gt -->|余弦相似度| param_eval_vt
   c_gt -->|余弦相似度| param_eval_v
   
-  param_flow --->|参数轨迹积分| param_eval_vt
+  param_flow --->|轨迹积分| param_eval_vt
 ```
 
 #### 术前骨骼的空间条件与通道注入
