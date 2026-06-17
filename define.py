@@ -266,7 +266,7 @@ class ContextEmbedder(torch.nn.Module):
 class ParameterVelocityHead(torch.nn.Module):
     """预测参数速度 v_c 的轻量级模块"""
 
-    def __init__(self, in_channels=12):
+    def __init__(self, in_channels=12, c_dim=768):
         super().__init__()
         self.conv = torch.nn.Sequential(
             torch.nn.Conv3d(in_channels, 32, kernel_size=3, stride=2, padding=1),
@@ -281,13 +281,15 @@ class ParameterVelocityHead(torch.nn.Module):
         )
         self.pool = torch.nn.AdaptiveAvgPool3d((1, 1, 1))
         self.time_proj = torch.nn.Sequential(torch.nn.Linear(1, 128), torch.nn.SiLU())
-        self.fc = torch.nn.Linear(128, 768)
+        self.c_proj = torch.nn.Sequential(torch.nn.Linear(c_dim, 128), torch.nn.SiLU())
+        self.fc = torch.nn.Linear(128, c_dim)
 
-    def forward(self, x, timesteps):
+    def forward(self, x, timesteps, c_t):
         feat = self.conv(x)
         feat = self.pool(feat).view(x.shape[0], -1)  # [B, 128]
         t_emb = self.time_proj(timesteps.view(-1, 1).float() / 1000.0)
-        return self.fc(feat + t_emb)
+        c_emb = self.c_proj(c_t)
+        return self.fc(feat + t_emb + c_emb)
 
 
 def rflow_unet(context_embedding_size=256):

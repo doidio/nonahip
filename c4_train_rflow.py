@@ -446,7 +446,7 @@ def main():
 
                 # 预测速度 (Velocity), 注入 Context
                 velocity_y_pred = rflow(x=input_tensor, timesteps=timesteps, context=context)
-                velocity_c_pred = param_head(x=input_tensor, timesteps=timesteps)
+                velocity_c_pred = param_head(x=input_tensor, timesteps=timesteps, c_t=c_t)
 
                 # 计算目标速度 (预测真实的 c_text_true)
                 target_velocity_y = image - noise_y
@@ -545,7 +545,7 @@ def main():
 
                     with amp_ctx:
                         velocity_y_pred = rflow(input_tensor, timesteps, context=context)
-                        velocity_c_pred = param_head(input_tensor, timesteps)
+                        velocity_c_pred = param_head(input_tensor, timesteps, c_t)
 
                         target_velocity_y = image - noise_y
                         target_velocity_c = c_text - noise_c
@@ -562,7 +562,7 @@ def main():
                     batch_cos_sim_v = torch.nn.functional.cosine_similarity(c_pred, c_text, dim=1).mean().item()
                     val_cos_sim_v_sum += batch_cos_sim_v
 
-                    # 50步精确评估 param_head (使用真实 y_t 轨迹)
+                    # 50步精确评估 param_head：从随机 c_t 出发，沿真实 y_t 轨迹积分到 c_data。
                     with torch.no_grad():
                         scheduler.set_timesteps(num_inference_steps=50)
                         temp_timesteps = scheduler.timesteps.to(device)
@@ -574,7 +574,7 @@ def main():
                             t_val_s = (t_s.float() / scheduler.num_train_timesteps).view(-1, 1).to(device)
                             y_t_s = t_val_s * image + (1.0 - t_val_s) * noise_y
                             with amp_ctx:
-                                v_c_pred_s = param_head(torch.cat([y_t_s, cond], dim=1), t_s[None].to(device).repeat(image.shape[0]))
+                                v_c_pred_s = param_head(torch.cat([y_t_s, cond], dim=1), t_s[None].to(device).repeat(image.shape[0]), c_t_pred)
                             c_t_pred, _ = scheduler.step(v_c_pred_s, t_s, c_t_pred, next_t_s)
 
                     batch_cos_sim_vt = torch.nn.functional.cosine_similarity(c_t_pred, c_text, dim=1).mean().item()
@@ -604,7 +604,7 @@ def main():
                                 model_input = torch.cat([generated, cond], dim=1)
 
                                 velocity_y_pred = rflow(model_input, t_input, context=current_context)
-                                velocity_c_pred = param_head(model_input, t_input)
+                                velocity_c_pred = param_head(model_input, t_input, generated_c)
 
                             with torch.no_grad():
                                 generated, _ = scheduler.step(velocity_y_pred, t, generated, next_t)

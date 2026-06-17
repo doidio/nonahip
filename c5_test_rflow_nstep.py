@@ -185,7 +185,7 @@ def main():
                     model_input = torch.cat([gn_y, cond], dim=1)
                     
                     v_y = rflow(model_input, t_input, context=current_context)
-                    v_c = param_head(model_input, t_input)
+                    v_c = param_head(model_input, t_input, gn_c)
                     
                     gn_y, _ = scheduler.step(v_y, t, gn_y, next_t)
                     gn_c, _ = scheduler.step(v_c, t, gn_c, next_t)
@@ -204,7 +204,7 @@ def main():
                     model_input = torch.cat([g50_y, cond], dim=1)
                     
                     v_y = rflow(model_input, t_input, context=current_context)
-                    v_c = param_head(model_input, t_input)
+                    v_c = param_head(model_input, t_input, g50_c)
                     
                     g50_y, _ = scheduler.step(v_y, t, g50_y, next_t)
                     g50_c, _ = scheduler.step(v_c, t, g50_c, next_t)
