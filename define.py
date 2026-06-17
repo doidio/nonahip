@@ -263,6 +263,39 @@ class ContextEmbedder(torch.nn.Module):
         return out
 
 
+class TextEmbeddingNormalizer(torch.nn.Module):
+    """将 PubMedBERT 参数向量映射到更适合流匹配的标准化空间"""
+
+    def __init__(self, mean, whitening, coloring):
+        super().__init__()
+        self.register_buffer('mean', mean.float())
+        self.register_buffer('whitening', whitening.float())
+        self.register_buffer('coloring', coloring.float())
+
+    @classmethod
+    def fit(cls, embeddings, shrinkage=0.05, eps=1e-5):
+        x = embeddings.float()
+        mean = x.mean(dim=0, keepdim=True)
+        centered = x - mean
+        cov = centered.T @ centered / max(x.shape[0] - 1, 1)
+        avg_var = torch.trace(cov) / cov.shape[0]
+        cov = (1.0 - shrinkage) * cov + shrinkage * avg_var * torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype)
+        eigvals, eigvecs = torch.linalg.eigh(cov)
+        eigvals = torch.clamp(eigvals, min=eps)
+        whitening = eigvecs @ torch.diag(torch.rsqrt(eigvals)) @ eigvecs.T
+        coloring = eigvecs @ torch.diag(torch.sqrt(eigvals)) @ eigvecs.T
+        return cls(mean.cpu(), whitening.cpu(), coloring.cpu())
+
+    def normalize(self, embeddings):
+        return (embeddings.float() - self.mean.to(embeddings.device)) @ self.whitening.to(embeddings.device)
+
+    def denormalize(self, embeddings):
+        return embeddings.float() @ self.coloring.to(embeddings.device) + self.mean.to(embeddings.device)
+
+    def forward(self, embeddings):
+        return self.normalize(embeddings)
+
+
 class ParameterVelocityHead(torch.nn.Module):
     """预测参数速度 v_c 的轻量级模块"""
 
