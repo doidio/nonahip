@@ -70,43 +70,44 @@ flowchart TB
 
   %% 数据特征
   bone_latent([骨骼潜变量])
-  pros_latent(["假体几何潜变量（加噪）"])
-  param_vec(["假体参数语义向量（加噪）"])
-  token([假体参数特征码])
+  pros_latent(["假体几何潜变量 y_t"])
+  param_vec(["假体参数语义向量 c_t"])
+  token([假体参数条件表征])
+  noise_c([数值噪声])
   
   %% 联合输入
-  input_tensor([联合潜变量])
-  time_step([时间步])
+  input_tensor([骨骼-假体拼接潜变量])
 
   %% 预测输出
 
   %% 模型
-  bone_ae[骨骼 3D VAE 编码器]
-  pros_ae[假体几何 3D VAE 编码器]
-  unet[假体几何 3D UNet 生成网络]
-  param_head[假体参数 3D CNN 回归网络]
-  embedder[MLP 投影网络]
+  bone_ae[骨骼潜空间编码器（AutoencoderKL）]
+  pros_ae[假体潜空间编码器（AutoencoderKL）]
+  noise_y([图像噪声])
+  unet[假体几何流场预测网络（3D UNet）]
+  param_head[假体参数流场预测头（3D CNN）]
+  embedder[假体参数条件映射网络（MLP）]
   transformer([深层 Transformer])
 
   %% 流程连线
   pre -->|"骨骼提取"| bone_ae --> bone_latent
   post -->|"假体几何提取"| pros_ae --> pros_latent
+  noise_y --> pros_latent
 
   record -->|"PubMedBERT 语义编码"| param_vec
+  noise_c --> param_vec
   
   param_vec -->|"768维"| embedder -->|"256维"| token
 
   bone_latent -->|"空间条件注入"| input_tensor
-  pros_latent -->|"监督"| input_tensor
+  pros_latent -->|"当前状态"| input_tensor
 
-  input_tensor --> unet
+  input_tensor -->|"空间条件与几何状态"| unet
   token -->|"全局条件注入"| transformer
   transformer -->|"交叉注意力"| unet
-  time_step -.-> unet
 
-  input_tensor --> param_head
-  param_vec -->|"监督"| param_head
-  time_step -.-> param_head
+  input_tensor -->|"骨骼-几何联合特征"| param_head
+  param_vec -->|"当前状态"| param_head
 
 ```
 
@@ -115,13 +116,13 @@ flowchart TB
 ```mermaid
 flowchart TB  
   %% ---- 联合演化核心动力学 ----
-  noise_y([假体几何 y_T 潜噪声])
-  noise_c([假体参数 c_T 噪声码])
+  noise_y([假体几何潜变量噪声 y_T])
+  noise_c([假体参数语义噪声 c_T])
 
-  unet[假体几何 3D UNet 生成网络]
-  cnn[假体参数 3D CNN 回归网络]
+  unet[假体几何流场预测网络（3D UNet）]
+  cnn[假体参数流场预测头（3D CNN）]
   
-  ode{联合 ODE 积分器}
+  ode{联合修正流积分器}
   
   %% 【特征 1：交织耦合 (相互跨模态注入)】
   noise_y --->|当前状态| unet
@@ -131,8 +132,8 @@ flowchart TB
   noise_c -->|条件注入| unet
 
   %% 【特征 2：共用 ODE (速度场统一求解)】
-  unet --->|速度 v_y 预测| ode
-  cnn --->|速度 v_c 预测| ode
+  unet --->|假体几何流场 v_y| ode
+  cnn --->|假体参数流场 v_c| ode
 
   %% 【循环与退出隐式语义】
   loop_cont([继续循环])
@@ -143,31 +144,31 @@ flowchart TB
 
   %% 结果输出与解码
   latent_y0([假体几何 y_0 潜变量])
-  code_c0([假体参数 c_0 特征码])
+  code_c0([假体参数语义向量 c_0])
 
   loop_exit --> latent_y0
   loop_exit --> code_c0
 
-  vae_dec[假体 3D VAE 解码器]
+  vae_dec[假体潜空间解码器（AutoencoderKL）]
   eval_geo{{验证假体几何生成能力}}
-  std_param([预测标准假体参数])
+  std_param([标准假体参数])
 
   latent_y0 --> vae_dec --> eval_geo
-  code_c0 -->|最近邻查询| std_param
+  code_c0 -->|假体库最近邻检索| std_param
 
   %% 与真实数据 (Ground Truth) 的全量对比验证
-  gt_param[(真实假体参数)]
+  gt_param[(真实假体参数语义向量)]
 
   eval_v{{验证假体参数瞬时推断能力}}
   eval_vt{{验证假体参数轨迹演化能力}}
 
-  %% 参数回归网络 (3D CNN) 的模型能力验证（脱离联合生成循环的独立评估）
-  cnn --->|速度 v_c 闭式解| eval_v
+  %% 假体参数流场预测头的模型能力验证（脱离联合生成循环的独立评估）
+  cnn --->|参数单步回推| eval_v
   
   gt_param -->|余弦相似度| eval_vt
   gt_param -->|余弦相似度| eval_v
   
-  cnn --->|速度 v_c 轨迹积分解| eval_vt
+  cnn --->|参数轨迹积分| eval_vt
 ```
 
 #### 术前骨骼的空间条件与通道注入
