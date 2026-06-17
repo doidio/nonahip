@@ -63,51 +63,50 @@
 
 ```mermaid
 flowchart TB
-  %% 数据输入
-  pre[(术前 CT 影像)]
-  post[(术后 CT 影像)]
-  record[(结构化假体参数)]
+  %% 输入数据
+  pre_ct[(术前 CT 影像)]
+  post_ct[(术后 CT 影像)]
+  param_record[(结构化假体参数)]
 
-  %% 数据特征
-  bone_latent([骨骼潜变量])
-  pros_latent(["假体几何潜变量 y_t"])
-  param_vec(["假体参数语义向量 c_t"])
-  token([假体参数条件表征])
-  noise_c([数值噪声])
+  %% 潜空间状态
+  z_bone([骨骼潜变量])
+  z_impl_t([假体几何潜变量 y_t])
+  c_t([假体参数语义向量 c_t])
+  c_token([假体参数条件表征])
+  eps_y([图像噪声])
+  eps_c([数值噪声])
   
-  %% 联合输入
-  input_tensor([骨骼-假体拼接潜变量])
+  %% 多模态输入
+  z_concat([多通道拼接潜变量])
 
-  %% 预测输出
+  %% 网络模块
+  bone_encoder[骨骼潜空间编码器（AutoencoderKL）]
+  impl_encoder[假体潜空间编码器（AutoencoderKL）]
+  geom_flow[假体几何流场预测网络（3D UNet）]
+  param_flow[假体参数流场预测头（3D CNN）]
+  param_embedder[假体参数条件映射网络（MLP）]
+  deep_transformer([深层 Transformer])
 
-  %% 模型
-  bone_ae[骨骼潜空间编码器（AutoencoderKL）]
-  pros_ae[假体潜空间编码器（AutoencoderKL）]
-  noise_y([图像噪声])
-  unet[假体几何流场预测网络（3D UNet）]
-  param_head[假体参数流场预测头（3D CNN）]
-  embedder[假体参数条件映射网络（MLP）]
-  transformer([深层 Transformer])
+  %% 编码与加噪
+  pre_ct -->|骨骼提取| bone_encoder --> z_bone
+  post_ct -->|假体几何提取| impl_encoder --> z_impl_t
+  eps_y --> z_impl_t
 
-  %% 流程连线
-  pre -->|"骨骼提取"| bone_ae --> bone_latent
-  post -->|"假体几何提取"| pros_ae --> pros_latent
-  noise_y --> pros_latent
-
-  record -->|"PubMedBERT 语义编码"| param_vec
-  noise_c --> param_vec
+  param_record -->|PubMedBERT 语义编码| c_t
+  eps_c --> c_t
   
-  param_vec -->|"768维"| embedder -->|"256维"| token
+  c_t -->|768维| param_embedder -->|256维| c_token
 
-  bone_latent -->|"空间条件注入"| input_tensor
-  pros_latent -->|"当前状态"| input_tensor
+  %% 条件注入
+  z_bone -->|空间条件注入| z_concat
+  z_impl_t -->|当前状态| z_concat
 
-  input_tensor -->|"空间条件与几何状态"| unet
-  token -->|"全局条件注入"| transformer
-  transformer -->|"交叉注意力"| unet
+  z_concat --> geom_flow
+  c_token -->|全局条件注入| deep_transformer
+  deep_transformer --->|交叉注意力| geom_flow
 
-  input_tensor -->|"骨骼-几何联合特征"| param_head
-  param_vec -->|"当前状态"| param_head
+  z_concat -->|特征输入| param_flow
+  c_t -->|当前状态| param_flow
 
 ```
 
@@ -115,60 +114,62 @@ flowchart TB
 
 ```mermaid
 flowchart TB  
-  %% ---- 联合演化核心动力学 ----
-  noise_y([假体几何潜变量噪声 y_T])
-  noise_c([假体参数语义噪声 c_T])
+  %% 初始噪声
+  z_impl_T([假体几何潜变量噪声 y_T])
+  c_T([假体参数语义噪声 c_T])
 
-  unet[假体几何流场预测网络（3D UNet）]
-  cnn[假体参数流场预测头（3D CNN）]
+  %% 网络模块
+  geom_flow[假体几何流场预测网络（3D UNet）]
+  param_flow[假体参数流场预测头（3D CNN）]
   
-  ode{联合修正流积分器}
+  %% 联合积分
+  flow_solver{联合修正流积分器}
   
-  %% 【特征 1：交织耦合 (相互跨模态注入)】
-  noise_y --->|当前状态| unet
-  noise_c -->|当前状态| cnn
+  %% 跨模态耦合
+  z_impl_T --->|当前状态| geom_flow
+  c_T -->|当前状态| param_flow
   
-  noise_y --->|特征输入| cnn
-  noise_c -->|条件注入| unet
+  z_impl_T --->|特征输入| param_flow
+  c_T -->|条件注入| geom_flow
 
-  %% 【特征 2：共用 ODE (速度场统一求解)】
-  unet --->|假体几何流场 v_y| ode
-  cnn --->|假体参数流场 v_c| ode
+  %% 流场求解
+  geom_flow --->|假体几何流场 v_y| flow_solver
+  param_flow --->|假体参数流场 v_c| flow_solver
 
-  %% 【循环与退出隐式语义】
+  %% 积分过程
   loop_cont([继续循环])
-  ode -->|t > 0| loop_cont
+  flow_solver -->|t > 0| loop_cont
 
   loop_exit([完成])
-  ode -->|t = 0| loop_exit
+  flow_solver -->|t = 0| loop_exit
 
   %% 结果输出与解码
-  latent_y0([假体几何 y_0 潜变量])
-  code_c0([假体参数语义向量 c_0])
+  z_impl_0([假体几何 y_0 潜变量])
+  c_0([假体参数语义向量 c_0])
 
-  loop_exit --> latent_y0
-  loop_exit --> code_c0
+  loop_exit --> z_impl_0
+  loop_exit --> c_0
 
-  vae_dec[假体潜空间解码器（AutoencoderKL）]
-  eval_geo{{验证假体几何生成能力}}
+  impl_decoder[假体潜空间解码器（AutoencoderKL）]
+  geom_eval{{验证假体几何生成能力}}
   std_param([标准假体参数])
 
-  latent_y0 --> vae_dec --> eval_geo
-  code_c0 -->|假体库最近邻检索| std_param
+  z_impl_0 --> impl_decoder --> geom_eval
+  c_0 -->|假体库最近邻检索| std_param
 
-  %% 与真实数据 (Ground Truth) 的全量对比验证
-  gt_param[(真实假体参数语义向量)]
+  %% 真实参数对照
+  c_gt[(真实假体参数语义向量)]
 
-  eval_v{{验证假体参数瞬时推断能力}}
-  eval_vt{{验证假体参数轨迹演化能力}}
+  param_eval_v{{验证假体参数瞬时推断能力}}
+  param_eval_vt{{验证假体参数轨迹演化能力}}
 
-  %% 假体参数流场预测头的模型能力验证（脱离联合生成循环的独立评估）
-  cnn --->|参数单步回推| eval_v
+  %% 参数预测头评估
+  param_flow --->|参数单步回推| param_eval_v
   
-  gt_param -->|余弦相似度| eval_vt
-  gt_param -->|余弦相似度| eval_v
+  c_gt -->|余弦相似度| param_eval_vt
+  c_gt -->|余弦相似度| param_eval_v
   
-  cnn --->|参数轨迹积分| eval_vt
+  param_flow --->|参数轨迹积分| param_eval_vt
 ```
 
 #### 术前骨骼的空间条件与通道注入
