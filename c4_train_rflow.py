@@ -447,8 +447,8 @@ def main():
                     c_text_strs_cond.append(true_text)
 
             with torch.no_grad():
-                c_text_true = text_normalizer(encode_texts(c_text_strs_true))
-                c_text_cond = text_normalizer(encode_texts(c_text_strs_cond))
+                c_text_all = text_normalizer(encode_texts(c_text_strs_true + c_text_strs_cond))
+                c_text_true, c_text_cond = c_text_all.chunk(2, dim=0)
 
             with amp_ctx:
                 # 采样时间步

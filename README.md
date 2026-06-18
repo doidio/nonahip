@@ -64,28 +64,28 @@
 ```mermaid
 flowchart TB
   %% 输入数据
-  pre_ct[(术前 CT 影像)]
-  post_ct[(术后 CT 影像)]
-  param_record[(结构化假体参数)]
+  pre_ct["术前 CT 影像"]
+  post_ct["术后 CT 影像"]
+  param_record["结构化假体参数"]
 
   %% 潜空间状态
-  z_bone([骨骼潜变量])
-  z_impl_t([假体几何潜变量 y_t])
-  c_t([假体参数语义向量 c_t])
-  c_token([假体参数条件表征])
-  eps_y([图像噪声])
-  eps_c([数值噪声])
-  
+  z_bone["骨骼潜变量 y_bone"]
+  z_impl_t["带噪假体几何潜变量 y_t"]
+  c_t["带噪假体参数语义向量 c_t"]
+  c_token["假体参数条件表征"]
+  eps_y["图像噪声"]
+  eps_c["数值噪声"]
+
   %% 多模态输入
-  z_concat([多通道拼接潜变量])
+  z_concat["多通道拼接潜变量"]
 
   %% 网络模块
-  bone_encoder[骨骼潜空间编码器（AutoencoderKL）]
-  impl_encoder[假体潜空间编码器（AutoencoderKL）]
-  geom_flow[假体几何流场预测网络（3D UNet）]
-  param_flow[假体参数流场预测头（3D CNN）]
-  param_embedder[假体参数条件映射网络（MLP）]
-  deep_transformer([深层 Transformer])
+  bone_encoder["骨骼潜空间编码器 AutoencoderKL"]
+  impl_encoder["假体潜空间编码器 AutoencoderKL"]
+  geom_flow["假体流场预测网络 3D UNet"]
+  param_flow["假体参数预测头 3D CNN"]
+  param_embedder["假体参数条件映射网络 MLP"]
+  deep_transformer["深层 Transformer"]
 
   %% 编码与加噪
   pre_ct -->|骨骼提取| bone_encoder --> z_bone
@@ -107,28 +107,27 @@ flowchart TB
 
   z_concat -->|特征输入| param_flow
   c_t -->|当前状态| param_flow
-
 ```
 
 #### 验证阶段
 
 ```mermaid
-flowchart TB  
+flowchart TB
   %% 初始噪声
-  z_impl_T([假体几何潜变量噪声 y_T])
-  c_T([假体参数语义噪声 c_T])
+  z_impl_T["假体几何潜变量噪声 y_T"]
+  c_T["假体参数语义噪声 c_T"]
 
   %% 网络模块
-  geom_flow[假体几何流场预测网络（3D UNet）]
-  param_flow[假体参数流场预测头（3D CNN）]
-  
+  geom_flow["假体流场预测网络 3D UNet"]
+  param_flow["假体参数预测头 3D CNN"]
+
   %% 联合积分
-  flow_solver{联合修正流积分器}
-  
+  flow_solver{"联合修正流积分器"}
+
   %% 跨模态耦合
   z_impl_T --->|当前状态| geom_flow
   c_T -->|当前状态| param_flow
-  
+
   z_impl_T --->|特征输入| param_flow
   c_T -->|条件注入| geom_flow
 
@@ -137,38 +136,38 @@ flowchart TB
   param_flow --->|假体参数流场 v_c| flow_solver
 
   %% 积分过程
-  loop_cont([继续循环])
-  flow_solver -->|t > 0| loop_cont
+  loop_cont["继续循环"]
+  flow_solver -->|t &gt; 0| loop_cont
 
-  loop_exit([完成])
+  loop_exit["完成"]
   flow_solver -->|t = 0| loop_exit
 
   %% 结果输出与解码
-  z_impl_0([假体几何 y_0 潜变量])
-  c_0([假体参数语义向量 c_0])
+  z_impl_0["假体几何潜变量 y_0"]
+  c_0["假体参数语义向量 c_0"]
 
   loop_exit --> z_impl_0
   loop_exit --> c_0
 
-  impl_decoder[假体潜空间解码器（AutoencoderKL）]
-  geom_eval{{验证假体几何生成能力}}
-  std_param([标准假体参数])
+  impl_decoder["假体潜空间解码器 AutoencoderKL"]
+  geom_eval["验证假体几何生成能力"]
+  std_param["标准假体参数"]
 
   z_impl_0 --> impl_decoder --> geom_eval
   c_0 -->|假体库最近邻检索| std_param
 
   %% 真实参数对照
-  c_gt[(真实假体参数语义向量)]
+  c_gt["真实假体参数语义向量"]
 
-  param_eval_v{{验证假体参数瞬时推断能力}}
-  param_eval_vt{{验证假体参数轨迹演化能力}}
+  param_eval_v["验证假体参数瞬时推断能力"]
+  param_eval_vt["验证假体参数轨迹演化能力"]
 
   %% 参数预测头评估
   param_flow --->|单步回推| param_eval_v
-  
+
   c_gt -->|余弦相似度| param_eval_vt
   c_gt -->|余弦相似度| param_eval_v
-  
+
   param_flow --->|轨迹积分| param_eval_vt
 ```
 
