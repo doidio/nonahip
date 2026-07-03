@@ -1,11 +1,6 @@
 import argparse
 import re
-from io import BytesIO
-from pathlib import Path
 
-import pandas as pd
-import tomlkit
-from tqdm import tqdm
 
 """
 b0_prothesis.py - 髋关节假体库 definition 与自动提取工具
@@ -618,7 +613,7 @@ def parse_stem(name, spec):
                 full = f'{m.group(2)} ({angle_str})'
                 size = full
             elif m := re.search(r'(125|135)°([0-9]{2})', text):
-                size = f'{m.group(2)} ({m.group(1)}°)'
+                size = f'{m.group(2)} ({m.group(1)}° Neck-Shaft Angle)'
             elif m := re.search(r'01\.00561\.3([0-9]{2})', text):
                 size = f'{m.group(1)} (135° Neck-Shaft Angle)'
         elif model == 'Zimmer Wagner SL':
@@ -762,15 +757,28 @@ def parse_head_offset(name, spec):
             val = float(m.group(1))
             if any(abs(o - val) < 0.01 for o in [x for x in HEAD_OFFSET if x != '']):
                 return val
-        except:
+        except Exception:
             pass
     return ''
 
 
 def extract_prothesis_info(config_file, input_file='THATable.xlsx', output_file='THATableExtracted.xlsx'):
     """主提取函数"""
+    from io import BytesIO
+    from pathlib import Path
+
+    import pandas as pd
+    import tomlkit
+    from tqdm import tqdm
+    try:
+        from minio import Minio
+    except ImportError as e:
+        raise RuntimeError('extract_prothesis_info requires the optional minio package and legacy minio configuration.') from e
+
     cfg_path = Path(config_file)
     cfg = tomlkit.loads(cfg_path.read_text('utf-8'))
+    if 'minio' not in cfg:
+        raise RuntimeError('extract_prothesis_info is a legacy MinIO-based extractor, but [minio] is absent from the config.')
     client = Minio(**cfg['minio']['client'])
 
     if not Path(input_file).exists():

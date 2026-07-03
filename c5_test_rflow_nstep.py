@@ -1,5 +1,4 @@
 import argparse
-import json
 from pathlib import Path
 
 import define
@@ -12,9 +11,9 @@ from monai.inferers import sliding_window_inference
 from monai.metrics import SSIMMetric
 from monai.transforms import Compose
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModel
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -50,8 +49,7 @@ def main():
                 test_files.append({
                     'image': f.as_posix(),
                     'prl': prl,
-                    'ctx_raw': tomlkit.dumps(tomlkit.loads(ctx_f.read_text('utf-8')).unwrap()),
-                    'condition': (train_root / 'cond' / f.name).as_posix()
+                    'context': tomlkit.loads(ctx_f.read_text('utf-8')).unwrap(),
                 })
             else:
                 raise RuntimeError(f'Non-exist {ctx_f.as_posix()}')
@@ -70,7 +68,7 @@ def main():
         vae.eval()
         return vae, loaded['scale_factor'], loaded['global_mean']
 
-    vae_cond, cond_sf, cond_mean = load_vae('pre')
+    _vae_cond, cond_sf, cond_mean = load_vae('pre')
     vae_image, image_sf, image_mean = load_vae('metal')
 
     transforms = Compose(
@@ -85,17 +83,12 @@ def main():
     test_ds = Dataset(data=test_files, transform=transforms)
     test_loader = DataLoader(test_ds, batch_size=1, num_workers=cfg_rflow.get('num_workers', 4))
 
-    # 4. Load Models (RFlow, ContextEmbedder, ParamHead, PubMedBERT)
-    print('Loading PubMedBERT...')
-    tokenizer = AutoTokenizer.from_pretrained(cfg_rflow['text_encoder_path'])
-    text_encoder = AutoModel.from_pretrained(cfg_rflow['text_encoder_path']).to(device)
-    text_encoder.eval()
-
+    # 4. Load Models
     print('Loading Generation Models...')
-    rflow = define.rflow_unet(context_embedding_size=768).to(device)
-    context_embedder = define.ContextEmbedder().to(device)
-    param_head = define.ParameterVelocityHead().to(device)
-    
+    embed_dim = 256
+    rflow = define.rflow_unet(context_embedding_size=embed_dim).to(device)
+    condition_encoder = define.StructuredProsthesisConditionEncoder(embed_dim=embed_dim).to(device)
+
     ckpt_path = Path(args.checkpoint) if args.checkpoint else (ckpt_dir / f'{task}_last.pt')
     print(f'Loading checkpoint: {ckpt_path}')
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -107,25 +100,25 @@ def main():
         elif name in ckpt:
             model.load_state_dict(ckpt[name])
             print(f'Loaded {name} raw state_dict.')
-            
+        else:
+            raise KeyError(f'Checkpoint lacks {name} or {name}_ema.')
+
     load_weight(rflow, 'rflow_state')
-    load_weight(context_embedder, 'context_state')
-    load_weight(param_head, 'param_state')
+    load_weight(condition_encoder, 'condition_encoder_state')
 
     rflow.eval()
-    context_embedder.eval()
-    param_head.eval()
+    condition_encoder.eval()
 
     scheduler = define.scheduler_rflow()
-    print(f'Comparison: {args.steps_n}-Step vs 50-Step (Joint Evolution)')
+    print(f'Comparison: {args.steps_n}-Step vs 50-Step Geometry Sampling')
 
     # 5. Test Loop
     l_psnrs, l_cosines = [], []
     i_psnrs, i_ssims = [], []
-    c_cosines_N_vs_50, c_cosines_N_vs_True, c_cosines_50_vs_True = [], [], []
 
     def decode_to_img(z):
         z_norm = (z / image_sf + image_mean).detach().to(device).float()
+
         def predictor(inputs: torch.Tensor) -> torch.Tensor:
             ch = vae_image.latent_channels
             if inputs.shape[1] > ch:
@@ -143,33 +136,29 @@ def main():
             progress=False,
         )
 
-    amp_ctx = torch.autocast(device_type=device.type)
+    def amp_context():
+        return torch.autocast(device_type=device.type)
     ssim_calc = SSIMMetric(spatial_dims=3, data_range=2.0)
 
     print(f'Starting Full Evaluation ({args.steps_n} vs 50)...')
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(test_loader)):
+        for batch in tqdm(test_loader):
             image = batch['image'].to(device)
-            cond = batch['condition'].to(device)
-
-            # Get Ground Truth Text Embedding
-            c_text_strs = []
-            for b in range(image.shape[0]):
-                ctx_str = batch['ctx_raw'][b] if 'ctx_raw' in batch else '{}'
-                ctx = json.loads(ctx_str)
-                c_text_strs.append(define.generate_text(ctx, level='full'))
-
-            tokens = tokenizer(c_text_strs, return_tensors='pt', padding=True, truncation=True, max_length=128).to(device)
-            outputs = text_encoder(**tokens)
-            attn_mask = tokens['attention_mask']
-            token_embs = outputs.last_hidden_state
-            input_mask = attn_mask.unsqueeze(-1).expand(token_embs.size()).float()
-            c_text_true = torch.sum(token_embs * input_mask, 1) / torch.clamp(input_mask.sum(1), min=1e-9)
+            bone_latent = batch['condition'].to(device)
+            stem_model_id = batch['stem_model_id'].to(device)
+            stem_spec_id = batch['stem_spec_id'].to(device)
+            numerics = batch['numerics'].to(device)
+            masks = batch['masks'].to(device)
+            current_bone, current_masks = define.apply_prosthesis_condition_mode(
+                bone_latent,
+                masks,
+                'bone_prosthesis_full',
+            )
+            condition_tokens = condition_encoder(stem_model_id, stem_spec_id, numerics, current_masks)
 
             # Same initial noise for both inferences
             generator = torch.Generator(device=device).manual_seed(42)
             z0_y = torch.randn(image.shape, device=device, generator=generator)
-            z0_c = torch.randn(c_text_true.shape, device=device, generator=generator)
 
             # --- N-Step Inference ---
             scheduler.set_timesteps(num_inference_steps=args.steps_n)
@@ -177,18 +166,14 @@ def main():
             next_timesteps_n = torch.cat([timesteps_n[1:], torch.zeros(1, dtype=timesteps_n.dtype, device=device)])
 
             gn_y = z0_y.clone()
-            gn_c = z0_c.clone()
-            with amp_ctx:
+            with amp_context():
                 for t, next_t in zip(timesteps_n, next_timesteps_n):
                     t_input = t[None].to(device)
-                    current_context = context_embedder(gn_c)
-                    model_input = torch.cat([gn_y, cond], dim=1)
-                    
-                    v_y = rflow(model_input, t_input, context=current_context)
-                    v_c = param_head(model_input, t_input, gn_c)
-                    
+                    model_input = torch.cat([gn_y, current_bone], dim=1)
+
+                    v_y = rflow(model_input, t_input, context=condition_tokens)
+
                     gn_y, _ = scheduler.step(v_y, t, gn_y, next_t)
-                    gn_c, _ = scheduler.step(v_c, t, gn_c, next_t)
 
             # --- 50-Step Inference ---
             scheduler.set_timesteps(num_inference_steps=50)
@@ -196,26 +181,18 @@ def main():
             next_timesteps_50 = torch.cat([timesteps_50[1:], torch.zeros(1, dtype=timesteps_50.dtype, device=device)])
 
             g50_y = z0_y.clone()
-            g50_c = z0_c.clone()
-            with amp_ctx:
+            with amp_context():
                 for t, next_t in zip(timesteps_50, next_timesteps_50):
                     t_input = t[None].to(device)
-                    current_context = context_embedder(g50_c)
-                    model_input = torch.cat([g50_y, cond], dim=1)
-                    
-                    v_y = rflow(model_input, t_input, context=current_context)
-                    v_c = param_head(model_input, t_input, g50_c)
-                    
+                    model_input = torch.cat([g50_y, current_bone], dim=1)
+
+                    v_y = rflow(model_input, t_input, context=condition_tokens)
+
                     g50_y, _ = scheduler.step(v_y, t, g50_y, next_t)
-                    g50_c, _ = scheduler.step(v_c, t, g50_c, next_t)
 
             # --- Evaluation ---
             l_cosines.append(F.cosine_similarity((gn_y - z0_y).flatten(), (g50_y - z0_y).flatten(), dim=0).item())
             l_psnrs.append(-10 * np.log10(F.mse_loss(gn_y, g50_y).item() + 1e-10))
-
-            c_cosines_N_vs_50.append(F.cosine_similarity(gn_c, g50_c, dim=1).mean().item())
-            c_cosines_N_vs_True.append(F.cosine_similarity(gn_c, c_text_true, dim=1).mean().item())
-            c_cosines_50_vs_True.append(F.cosine_similarity(g50_c, c_text_true, dim=1).mean().item())
 
             img_n = decode_to_img(gn_y)
             img_50 = decode_to_img(g50_y)
@@ -227,16 +204,12 @@ def main():
 
     # 6. Report
     print('\n' + '=' * 60)
-    print(f'FINAL REPORT: {args.steps_n}-Step vs 50-Step (Joint Evolution)')
+    print(f'FINAL REPORT: {args.steps_n}-Step vs 50-Step Geometry Sampling')
     print('=' * 60)
     print(f'Geometry (y) Latent PSNR:   {np.mean(l_psnrs):.2f} dB')
     print(f'Geometry (y) Latent CosSim: {np.mean(l_cosines):.4f}')
     print(f'Geometry (y) Image PSNR:    {np.mean(i_psnrs):.2f} dB')
     print(f'Geometry (y) Image SSIM:    {np.mean(i_ssims):.4f}')
-    print('-' * 60)
-    print(f'Parameter (c) CosSim [N vs 50]:   {np.mean(c_cosines_N_vs_50):.4f}')
-    print(f'Parameter (c) CosSim [N vs True]: {np.mean(c_cosines_N_vs_True):.4f}')
-    print(f'Parameter (c) CosSim [50 vs True]:{np.mean(c_cosines_50_vs_True):.4f}')
     print('=' * 60)
 
 

@@ -1,8 +1,8 @@
-import json
 from copy import deepcopy
 
 import numpy as np
 import torch
+from b0_preload_prothesis import FEMORAL
 from monai.losses import PerceptualLoss
 from monai.networks.nets import AutoencoderKL, DiffusionModelUNet, PatchDiscriminator
 from monai.networks.schedulers import RFlowScheduler
@@ -33,6 +33,65 @@ sdf_t = 5.0  # 截断距离 mm
 
 
 vae_downsample = 4
+
+FEMORAL_STEM_MODELS = tuple(sorted(FEMORAL.keys()))
+FEMORAL_STEM_SPECS = tuple((model, size) for model in FEMORAL_STEM_MODELS for size in FEMORAL[model])
+PROSTHESIS_NUMERIC_RANGES = {
+    'cup_outer': (38.0, 62.0),
+    'head_outer': (20.0, 44.0),
+    'head_offset': (-6.0, 9.0),
+    'liner_offset': (0.0, 6.0),
+}
+PROSTHESIS_CONDITION_MODES = (
+    'unconditional',
+    'bone_only',
+    'prosthesis_full_only',
+    'bone_stem_model',
+    'bone_stem_model_spec',
+    'bone_prosthesis_full',
+)
+PROSTHESIS_CONDITION_MODE_LABELS = {
+    'unconditional': 'Unconditional',
+    'bone_only': 'Bone only',
+    'prosthesis_full_only': 'Prosthesis parameters only',
+    'bone_stem_model': 'Bone + stem model',
+    'bone_stem_model_spec': 'Bone + stem model/spec',
+    'bone_prosthesis_full': 'Bone + full prosthesis parameters',
+}
+STEM_MODEL_TOKEN = 0
+STEM_MODEL_SPEC_TOKEN = 1
+
+
+def enforce_prosthesis_condition_dependencies(prosthesis_masks):
+    squeeze = prosthesis_masks.ndim == 1
+    if squeeze:
+        prosthesis_masks = prosthesis_masks.unsqueeze(0)
+    prosthesis_masks = prosthesis_masks.clone()
+    prosthesis_masks[:, STEM_MODEL_SPEC_TOKEN] *= prosthesis_masks[:, STEM_MODEL_TOKEN]
+    return prosthesis_masks.squeeze(0) if squeeze else prosthesis_masks
+
+
+def apply_prosthesis_condition_mode(bone_latent, prosthesis_masks, mode):
+    bone_latent = bone_latent.clone()
+    prosthesis_masks = enforce_prosthesis_condition_dependencies(prosthesis_masks)
+
+    if mode == 'unconditional':
+        bone_latent.zero_()
+        prosthesis_masks.zero_()
+    elif mode == 'bone_only':
+        prosthesis_masks.zero_()
+    elif mode == 'prosthesis_full_only':
+        bone_latent.zero_()
+    elif mode == 'bone_stem_model':
+        prosthesis_masks[:, STEM_MODEL_SPEC_TOKEN:] = 0.0
+    elif mode == 'bone_stem_model_spec':
+        prosthesis_masks[:, STEM_MODEL_SPEC_TOKEN + 1 :] = 0.0
+    elif mode == 'bone_prosthesis_full':
+        pass
+    else:
+        raise ValueError(f'Unknown prosthesis condition mode: {mode}')
+
+    return bone_latent, enforce_prosthesis_condition_dependencies(prosthesis_masks)
 
 
 def vae_kl(channels: int):
@@ -118,25 +177,23 @@ def vae_val_transforms(patch_size, channels):
     ]
 
 
-class LoadLatentConditiond(MapTransform):
-    """读取 .npy 文件 latent 数据 [12, D, H, W] float16"""
+class LoadRFlowLatentsd(MapTransform):
+    """读取 RFlow 训练用潜变量：[术前骨骼 4 通道, 假体 TSDF 8 通道]"""
 
     def __init__(self, keys, allow_missing_keys=False):
         super().__init__(keys, allow_missing_keys)
 
     def __call__(self, data):
         d = dict(data)
-        # 加载 npy
         data_npy = np.load(d['image'])
 
-        # 转换为 Tensor
         if isinstance(data_npy, np.ndarray):
             data_tensor = torch.from_numpy(data_npy).float()
         else:
             data_tensor = data_npy.float()
 
-        d['condition'] = data_tensor[0:4]  # 术前
-        d['image'] = data_tensor[4:12]  # 假体
+        d['condition'] = data_tensor[0:4]
+        d['image'] = data_tensor[4:12]
 
         return d
 
@@ -161,81 +218,120 @@ class ScaleLatentd(MapTransform):
         return d
 
 
-def generate_text(ctx, level='full'):
-    """
-    Generate dense K-V string from context.
-    Levels:
-    - 'full': keep all parameters
-    - 'model_size': keep only Femoral Model and Size
-    - 'model': keep only Femoral Model
-    """
-    if not ctx:
-        return ''
-
-    def has_value(x):
-        return x is not None and x != ''
-
-    parts = []
-
-    femoral_spec = ctx.get('femoral_spec', [])
-    femoral_model = femoral_spec[0] if len(femoral_spec) >= 1 and has_value(femoral_spec[0]) else None
-    femoral_size = femoral_spec[1] if len(femoral_spec) >= 2 and has_value(femoral_spec[1]) else None
-    if femoral_model:
-        if level in ['full', 'model_size']:
-            if femoral_size:
-                parts.append(f'Femoral Model: {femoral_model}, Size: {femoral_size}')
-            else:
-                parts.append(f'Femoral Model: {femoral_model}')
-        elif level == 'model':
-            parts.append(f'Femoral Model: {femoral_model}')
-
-    if level == 'full':
-        head_outer = ctx.get('head_outer')
-        if has_value(head_outer):
-            parts.append(f'Head Diameter: {head_outer} mm')
-
-        head_offset = ctx.get('head_offset')
-        if has_value(head_offset):
-            parts.append(f'Head Offset: {head_offset} mm')
-
-        cup_outer = ctx.get('cup_outer_best')
-        if not has_value(cup_outer):
-            cup_outer = ctx.get('cup_outer')
-        if has_value(cup_outer):
-            parts.append(f'Cup Diameter: {cup_outer} mm')
-
-        liner_material = ctx.get('liner_material')
-        if has_value(liner_material):
-            parts.append(f'Liner Material: {liner_material}')
-
-        liner_offset = ctx.get('liner_offset')
-        if has_value(liner_offset):
-            parts.append(f'Liner Offset: {liner_offset} mm')
-
-    return ' | '.join(parts)
+def _has_context_value(x):
+    if x is None:
+        return False
+    if isinstance(x, str):
+        text = x.strip().lower()
+        return text != '' and text not in {'nan', 'none', 'null'}
+    if isinstance(x, (list, tuple)):
+        return any(_has_context_value(item) for item in x)
+    if isinstance(x, (int, float, np.number)):
+        return bool(np.isfinite(x))
+    return x != ''
 
 
-class PrepareContextd(MapTransform):
-    """提取 TOML 中的手术设计参数并保留为原始字典"""
+def _strip_context_string(x):
+    return x.strip() if isinstance(x, str) else x
+
+
+def _get_context_value(ctx, key, prefer_best=True):
+    if prefer_best:
+        best_value = ctx.get(f'{key}_best')
+        if _has_context_value(best_value):
+            return best_value
+    return ctx.get(key)
+
+
+def _as_context_sequence(value, length):
+    if isinstance(value, (list, tuple)):
+        sequence = list(value)
+    elif _has_context_value(value):
+        sequence = [value]
+    else:
+        sequence = []
+    return [sequence[i] if i < len(sequence) else '' for i in range(length)]
+
+
+def _get_context_sequence(ctx, key, length, prefer_best=True):
+    raw_values = _as_context_sequence(ctx.get(key), length)
+    if not prefer_best:
+        return raw_values
+    best_values = _as_context_sequence(ctx.get(f'{key}_best'), length)
+    return [best if _has_context_value(best) else raw for raw, best in zip(raw_values, best_values)]
+
+
+def _scale_context_number(value, min_value, max_value):
+    if not _has_context_value(value):
+        return 0.0, 0.0
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+    if not np.isfinite(value):
+        return 0.0, 0.0
+    scaled = 2.0 * (value - min_value) / (max_value - min_value) - 1.0
+    return float(np.clip(scaled, -1.0, 1.0)), 1.0
+
+
+class PrepareProsthesisConditiond(MapTransform):
+    """提取结构化假体条件"""
 
     def __init__(self, keys, allow_missing_keys=False):
         super().__init__(keys, allow_missing_keys)
+        self.stem_model_to_id = {model: i for i, model in enumerate(FEMORAL_STEM_MODELS)}
+        self.stem_spec_to_id = {spec: i for i, spec in enumerate(FEMORAL_STEM_SPECS)}
+
+    def _encode_category(self, value, mapping):
+        value = _strip_context_string(value)
+        if _has_context_value(value) and value in mapping:
+            return mapping[value], 1.0
+        return mapping.get('', 0), 0.0
+
+    def _encode_stem_spec(self, femoral_model, femoral_size):
+        femoral_model = _strip_context_string(femoral_model)
+        femoral_size = _strip_context_string(femoral_size)
+        if _has_context_value(femoral_model) and _has_context_value(femoral_size):
+            if femoral_size in FEMORAL.get(femoral_model, []):
+                return self.stem_spec_to_id[(femoral_model, femoral_size)], 1.0
+        return self.stem_spec_to_id.get(('', ''), 0), 0.0
 
     def __call__(self, data):
         d = dict(data)
-
         ctx = d.get('context', {})
-        d['ctx_raw'] = json.dumps(ctx)
 
-        # 默认这里不再预先生成 c_text，因为训练时会在每个 batch 内动态生成
+        femoral_spec = _get_context_sequence(ctx, 'femoral_spec', length=2)
+        stem_model = femoral_spec[0] if len(femoral_spec) >= 1 else ''
+        stem_size = femoral_spec[1] if len(femoral_spec) >= 2 else ''
+
+        stem_model_id, stem_model_mask = self._encode_category(stem_model, self.stem_model_to_id)
+        stem_spec_id, stem_spec_mask = self._encode_stem_spec(stem_model, stem_size)
+
+        cup_outer = _get_context_value(ctx, 'cup_outer')
+        head_outer = _get_context_value(ctx, 'head_outer')
+        head_offset = _get_context_value(ctx, 'head_offset')
+        liner_offset = ctx.get('liner_offset')
+
+        cup_outer_value, cup_outer_mask = _scale_context_number(cup_outer, *PROSTHESIS_NUMERIC_RANGES['cup_outer'])
+        head_outer_value, head_outer_mask = _scale_context_number(head_outer, *PROSTHESIS_NUMERIC_RANGES['head_outer'])
+        head_offset_value, head_offset_mask = _scale_context_number(head_offset, *PROSTHESIS_NUMERIC_RANGES['head_offset'])
+        liner_offset_value, liner_offset_mask = _scale_context_number(liner_offset, *PROSTHESIS_NUMERIC_RANGES['liner_offset'])
+
+        d['stem_model_id'] = torch.tensor(stem_model_id, dtype=torch.long)
+        d['stem_spec_id'] = torch.tensor(stem_spec_id, dtype=torch.long)
+        d['numerics'] = torch.tensor([cup_outer_value, head_outer_value, head_offset_value, liner_offset_value], dtype=torch.float32)
+        d['masks'] = torch.tensor(
+            [stem_model_mask, stem_spec_mask, cup_outer_mask, head_outer_mask, head_offset_mask, liner_offset_mask],
+            dtype=torch.float32,
+        )
+
         d.pop('context', None)
-
         return d
 
 
 def rflow_transforms(image_mean, image_sf, cond_mean, cond_sf):
     return [
-        LoadLatentConditiond(keys=['image']),
+        LoadRFlowLatentsd(keys=['image']),
         ScaleLatentd(
             keys=['image', 'condition'],
             image_mean=image_mean,
@@ -243,86 +339,43 @@ def rflow_transforms(image_mean, image_sf, cond_mean, cond_sf):
             cond_mean=cond_mean,
             cond_sf=cond_sf,
         ),
-        PrepareContextd(keys=['context']),
+        PrepareProsthesisConditiond(keys=['context']),
     ]
 
 
-class ContextEmbedder(torch.nn.Module):
-    """将带噪参数 c_t 映射为 UNet 交叉注意力 Token 的模态桥梁"""
+class StructuredProsthesisConditionEncoder(torch.nn.Module):
+    """将结构化假体条件编码为 UNet 交叉注意力 token"""
 
     def __init__(self, embed_dim=256):
         super().__init__()
-        # 初始化一个 3 层 MLP
-        self.mlp = torch.nn.Sequential(torch.nn.Linear(768, 1024), torch.nn.SiLU(), torch.nn.Linear(1024, 1536))
+        self.stem_model_emb = torch.nn.Embedding(len(FEMORAL_STEM_MODELS), embed_dim)
+        self.stem_spec_emb = torch.nn.Embedding(len(FEMORAL_STEM_SPECS), embed_dim)
 
-    def forward(self, c_t):
-        # c_t Shape: [B, 768]
-        x = self.mlp(c_t)
-        # 返回形状为 [B, 6, 256] 的 context_tokens
-        out = x.view(x.shape[0], 6, 256)
-        return out
+        self.cup_outer_proj = torch.nn.Linear(1, embed_dim)
+        self.head_outer_proj = torch.nn.Linear(1, embed_dim)
+        self.head_offset_proj = torch.nn.Linear(1, embed_dim)
+        self.liner_offset_proj = torch.nn.Linear(1, embed_dim)
+        self.token_norm = torch.nn.LayerNorm(embed_dim)
 
+    def forward(self, stem_model_id, stem_spec_id, numerics, masks=None):
+        stem_model_embed = self.stem_model_emb(stem_model_id)
+        stem_spec_embed = self.stem_spec_emb(stem_spec_id)
+        cup_outer_embed = self.cup_outer_proj(numerics[:, 0:1])
+        head_outer_embed = self.head_outer_proj(numerics[:, 1:2])
+        head_offset_embed = self.head_offset_proj(numerics[:, 2:3])
+        liner_offset_embed = self.liner_offset_proj(numerics[:, 3:4])
 
-class TextEmbeddingNormalizer(torch.nn.Module):
-    """将 PubMedBERT 参数向量映射到更适合流匹配的标准化空间"""
-
-    def __init__(self, mean, whitening, coloring):
-        super().__init__()
-        self.register_buffer('mean', mean.float())
-        self.register_buffer('whitening', whitening.float())
-        self.register_buffer('coloring', coloring.float())
-
-    @classmethod
-    def fit(cls, embeddings, shrinkage=0.05, eps=1e-5):
-        x = embeddings.float()
-        mean = x.mean(dim=0, keepdim=True)
-        centered = x - mean
-        cov = centered.T @ centered / max(x.shape[0] - 1, 1)
-        avg_var = torch.trace(cov) / cov.shape[0]
-        cov = (1.0 - shrinkage) * cov + shrinkage * avg_var * torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype)
-        eigvals, eigvecs = torch.linalg.eigh(cov)
-        eigvals = torch.clamp(eigvals, min=eps)
-        whitening = eigvecs @ torch.diag(torch.rsqrt(eigvals)) @ eigvecs.T
-        coloring = eigvecs @ torch.diag(torch.sqrt(eigvals)) @ eigvecs.T
-        return cls(mean.cpu(), whitening.cpu(), coloring.cpu())
-
-    def normalize(self, embeddings):
-        return (embeddings.float() - self.mean.to(embeddings.device)) @ self.whitening.to(embeddings.device)
-
-    def denormalize(self, embeddings):
-        return embeddings.float() @ self.coloring.to(embeddings.device) + self.mean.to(embeddings.device)
-
-    def forward(self, embeddings):
-        return self.normalize(embeddings)
-
-
-class ParameterVelocityHead(torch.nn.Module):
-    """预测参数速度 v_c 的轻量级模块"""
-
-    def __init__(self, in_channels=12, c_dim=768):
-        super().__init__()
-        self.conv = torch.nn.Sequential(
-            torch.nn.Conv3d(in_channels, 32, kernel_size=3, stride=2, padding=1),
-            torch.nn.GroupNorm(8, 32),
-            torch.nn.SiLU(),
-            torch.nn.Conv3d(32, 64, kernel_size=3, stride=2, padding=1),
-            torch.nn.GroupNorm(16, 64),
-            torch.nn.SiLU(),
-            torch.nn.Conv3d(64, 128, kernel_size=3, stride=2, padding=1),
-            torch.nn.GroupNorm(32, 128),
-            torch.nn.SiLU(),
+        out = torch.stack(
+            [stem_model_embed, stem_spec_embed, cup_outer_embed, head_outer_embed, head_offset_embed, liner_offset_embed],
+            dim=1,
         )
-        self.pool = torch.nn.AdaptiveAvgPool3d((1, 1, 1))
-        self.time_proj = torch.nn.Sequential(torch.nn.Linear(1, 128), torch.nn.SiLU())
-        self.c_proj = torch.nn.Sequential(torch.nn.Linear(c_dim, 128), torch.nn.SiLU())
-        self.fc = torch.nn.Linear(128, c_dim)
+        out = self.token_norm(out)
 
-    def forward(self, x, timesteps, c_t):
-        feat = self.conv(x)
-        feat = self.pool(feat).view(x.shape[0], -1)  # [B, 128]
-        t_emb = self.time_proj(timesteps.view(-1, 1).float() / 1000.0)
-        c_emb = self.c_proj(c_t)
-        return self.fc(feat + t_emb + c_emb)
+        if masks is not None:
+            masks = enforce_prosthesis_condition_dependencies(masks)
+            out = out * masks.unsqueeze(-1)
+
+        return out
 
 
 def rflow_unet(context_embedding_size=256):

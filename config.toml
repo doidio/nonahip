@@ -41,9 +41,6 @@ excluded = [
 [dataset]
 root = "/config/workspace/public-hdd/dataset-tha"
 
-[pretrained]
-text_encoder = "/config/workspace/public-hdd/pretrained/S-PubMedBert-MS-MARCO"
-
 [train]
 root = "/config/workspace/public-ssd/train-tha"
 
@@ -75,6 +72,34 @@ effective_batch_size = 48
 sw_batch_size = 12
 lr = 0.0001
 ema_decay = 0.999
+
+[train.rflow.condition_mode_weights]
+unconditional = 1.0
+bone_only = 1.0
+prosthesis_full_only = 1.0
+bone_stem_model = 1.0
+bone_stem_model_spec = 1.0
+bone_prosthesis_full = 1.0
+
+[train.metal_cls]
+use_amp = true
+resume = false
+num_workers = 4
+num_epochs = 1000
+val_interval = 1
+lr = 0.0001
+weight_decay = 0.0001
+generated_steps = 5
+synthetic_train_samples_per_epoch = 256
+synthetic_val_samples = 0
+synthetic_batch_size = 16
+probe_largest_samples = 4
+
+[train.metal_cls.numeric_soft_label_sigma]
+cup_outer = 2.0
+head_outer = 2.0
+head_offset = 1.0
+liner_offset = 1.0
 
 [val]
 3239892_L = "Stryker Accolade TMZF"

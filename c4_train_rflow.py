@@ -1,5 +1,4 @@
 import argparse
-import json
 import random
 import sys
 from contextlib import nullcontext
@@ -16,7 +15,6 @@ from PIL import Image
 from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
 
 import define
 from kernel import fast_drr
@@ -39,12 +37,14 @@ def main():
     cfg = tomlkit.loads(config_path.read_text('utf-8')).unwrap()
     progress_enabled = sys.stderr.isatty()
 
+    task = 'rflow'
+    resume = bool(args.resume or cfg['train'][task].get('resume', False))
+
     train_root = Path(str(cfg['train']['root']))
     dataset_root = Path(cfg['dataset']['root'])
     log_dir = train_root / 'logs'
     ckpt_dir = train_root / 'checkpoints'
 
-    task = 'rflow'
     (
         use_amp,
         num_workers,
@@ -67,17 +67,18 @@ def main():
             'ema_decay',
         )
     ]
+    use_amp = bool(use_amp and device.type == 'cuda')
 
     print('Effective Batch:\t', effective_batch_size)
 
     patch_size = list(cfg['train']['vae']['patch_size'])
 
     val_prls, test_prls = set(cfg['val'].keys()), set(cfg['test'].keys())
-    train_files, val_files, test_files = [], [], []
+    train_files, val_files = [], []
 
     for image_file in (train_root / 'latents').glob('*.npy'):
         prl = '_'.join(image_file.name.removesuffix('.npy').split('_')[:2])
-        if prl in cfg['pairs']['excluded']:
+        if prl in cfg['pairs']['excluded'] or prl in test_prls:
             continue
 
         pid, rl = prl.split('_')
@@ -87,21 +88,22 @@ def main():
         else:
             raise RuntimeError(f'Non-exist {f.as_posix()}')
 
-        if prl in test_prls:
-            test_files.append(it)
-        elif prl in val_prls:
+        if prl in val_prls:
             val_files.append(it)
         else:
             train_files.append(it)
 
     train_files.sort(key=lambda x: x['prl'])
     val_files.sort(key=lambda x: x['prl'])
-    test_files.sort(key=lambda x: x['prl'])
-
-    val_prl = val_files[0]['prl'] if len(val_files) else None
 
     print('Train:\t', len(train_files))
     print('Val:\t', len(val_files))
+    if not train_files:
+        raise RuntimeError('Empty training split.')
+    if not val_files:
+        raise RuntimeError('Empty validation split.')
+
+    val_prl = val_files[0]['prl']
 
     def load_vae(subtask):
         ckpt_path = (ckpt_dir / f'vae_{subtask}_best.pt').resolve()
@@ -149,111 +151,64 @@ def main():
 
     train_ds = Dataset(data=train_files, transform=transforms)
     val_ds = Dataset(data=val_files, transform=transforms)
+    pin_memory = device.type == 'cuda'
+    persistent_workers = num_workers > 0
 
     # 妥协与机制调整说明：
     # 为了避免批次间的动态 Padding (导致背景噪声区占比较大以及引入人为边界伪影)，
     # 我们将 batch_size 设为 1，逐个加载单样本进行训练。
     # 由于每个样本单独加载，不再存在多样本拼 Batch 时的尺寸对齐需求，故完全取消了动态 Padding 整理函数 (collate_fn)
     # 和动态体积采样器 (batch_sampler)。
-    # 显存及优化稳定性方面，通过梯度累加 (每 effective_batch_size=12 次反向传播后执行一次优化器更新)
+    # 显存及优化稳定性方面，通过梯度累加在固定样本数后执行一次优化器更新
     # 依然能够实现宏观上的大 Batch 均值效应，确保训练的稳定性与收敛效果。
     train_loader = DataLoader(
         train_ds,
         batch_size=1,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
     )
     # 验证 Loader 保持 BS=1 即可
-    val_loader = DataLoader(val_ds, batch_size=1, num_workers=num_workers)
+    val_loader = DataLoader(val_ds, batch_size=1, num_workers=num_workers, pin_memory=pin_memory, persistent_workers=persistent_workers)
 
     embed_dim = 256
     rflow = define.rflow_unet(context_embedding_size=embed_dim).to(device)
-    context_embedder = define.ContextEmbedder(embed_dim=embed_dim).to(device)
-    param_head = define.ParameterVelocityHead().to(device)
+    condition_encoder = define.StructuredProsthesisConditionEncoder(embed_dim=embed_dim).to(device)
     rflow_ema = define.EMA(rflow, decay=ema_decay)
-    context_ema = define.EMA(context_embedder, decay=ema_decay)
-    param_ema = define.EMA(param_head, decay=ema_decay)
-
-    print('Loading Sentence-PubMedBERT...')
-    model_dir = cfg['pretrained']['text_encoder']
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    text_encoder = AutoModel.from_pretrained(model_dir).to(device)
-    text_encoder.eval()
-    for param in text_encoder.parameters():
-        param.requires_grad = False
-
-    def encode_texts(texts):
-        tokens = tokenizer(texts, return_tensors='pt', padding=True, truncation=True, max_length=128).to(device)
-        with torch.no_grad():
-            outputs = text_encoder(**tokens)
-            attn_mask = tokens['attention_mask']
-            token_embs = outputs.last_hidden_state
-            input_mask = attn_mask.unsqueeze(-1).expand(token_embs.size()).float()
-            return torch.sum(token_embs * input_mask, 1) / torch.clamp(input_mask.sum(1), min=1e-9)
-
-    def fit_text_normalizer():
-        print('Fitting PubMedBERT embedding normalizer...')
-        train_texts = [define.generate_text(it['context'], level='full') for it in train_files]
-        normalizer_texts = []
-        for it in train_files:
-            ctx = it['context']
-            full_text = define.generate_text(ctx, level='full')
-            normalizer_texts.extend(['', '', full_text, full_text, define.generate_text(ctx, level='model'), define.generate_text(ctx, level='model_size')])
-        normalizer_embeddings = []
-        with torch.no_grad():
-            for i in tqdm(range(0, len(normalizer_texts), 64), desc='TextNorm', disable=not progress_enabled):
-                normalizer_embeddings.append(encode_texts(normalizer_texts[i : i + 64]).cpu())
-            normalizer = define.TextEmbeddingNormalizer.fit(torch.cat(normalizer_embeddings, dim=0), shrinkage=0.005, eps=1e-4).to(device)
-            train_full_embeddings = []
-            for i in range(0, len(train_texts), 64):
-                train_full_embeddings.append(encode_texts(train_texts[i : i + 64]).cpu())
-            train_full_embeddings = torch.cat(train_full_embeddings, dim=0).to(device)
-            noise_scale = torch.linalg.vector_norm(normalizer(train_full_embeddings), dim=1).mean() / (train_full_embeddings.shape[1] ** 0.5)
-        print('Parameter noise scale:\t', float(noise_scale))
-        return normalizer, noise_scale
+    condition_ema = define.EMA(condition_encoder, decay=ema_decay)
 
     scheduler = define.scheduler_rflow()
+    condition_modes = define.PROSTHESIS_CONDITION_MODES
+    condition_weight_cfg = cfg['train'][task].get('condition_mode_weights', {})
+    condition_mode_weights = tuple(float(condition_weight_cfg.get(mode, 1.0)) for mode in condition_modes)
+    if any(weight < 0 for weight in condition_mode_weights):
+        raise ValueError('Condition mode weights must be non-negative.')
+    if sum(condition_mode_weights) <= 0:
+        raise ValueError('At least one condition mode weight must be positive.')
+    condition_mode_labels = define.PROSTHESIS_CONDITION_MODE_LABELS
+    print('Condition Mode Weights:\t', {condition_mode_labels[mode]: weight for mode, weight in zip(condition_modes, condition_mode_weights)})
 
-    optimizer = torch.optim.AdamW(
-        list(rflow.parameters()) + list(context_embedder.parameters()) + list(param_head.parameters()), lr=lr, weight_decay=1e-5
-    )
+    trainable_params = list(rflow.parameters()) + list(condition_encoder.parameters())
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=1e-5)
 
     scaler = GradScaler() if use_amp else None
 
     start_epoch = 0
 
     # 继续训练
-    if args.resume:
+    if resume:
         load_pt = (ckpt_dir / f'{task}_last.pt').resolve()
     else:
         load_pt = None
-
-    text_normalizer = None
-    c_noise_scale = None
 
     if load_pt and load_pt.exists():
         try:
             print('Resuming:\t', load_pt)
             ckpt = torch.load(load_pt, map_location=device)
             rflow.load_state_dict(ckpt['rflow_state'])
-
-            if 'context_state' in ckpt:
-                print('Loading ContextEmbedder...')
-                context_embedder.load_state_dict(ckpt['context_state'])
-
-            if 'param_state' in ckpt:
-                print('Loading ParameterVelocityHead...')
-                param_head.load_state_dict(ckpt['param_state'])
-
-            if 'text_normalizer' not in ckpt or 'c_noise_scale' not in ckpt:
-                raise RuntimeError('Checkpoint lacks text_normalizer or c_noise_scale and is incompatible with normalized parameter training.')
-            print('Loading TextEmbeddingNormalizer...')
-            state = ckpt['text_normalizer']
-            text_normalizer = define.TextEmbeddingNormalizer(state['mean'], state['whitening'], state['coloring']).to(device)
-            c_noise_scale = torch.as_tensor(ckpt['c_noise_scale'], device=device)
-            print('Parameter noise scale:\t', float(c_noise_scale))
+            print('Loading StructuredProsthesisConditionEncoder...')
+            condition_encoder.load_state_dict(ckpt['condition_encoder_state'])
 
             optimizer.load_state_dict(ckpt['optimizer'])
             for param_group in optimizer.param_groups:
@@ -264,32 +219,27 @@ def main():
             if 'rflow_state_ema' in ckpt:
                 rflow_ema.load_state_dict(ckpt['rflow_state_ema'])
 
-            if 'context_state_ema' in ckpt:
-                context_ema.load_state_dict(ckpt['context_state_ema'])
-
-            if 'param_state_ema' in ckpt:
-                param_ema.load_state_dict(ckpt['param_state_ema'])
+            condition_ema.load_state_dict(ckpt['condition_encoder_state_ema'])
 
             if use_amp and 'scaler' in ckpt:
                 scaler.load_state_dict(ckpt['scaler'])
 
             start_epoch = ckpt['epoch']
-            val_loss = ckpt.get('val_loss', float('inf'))
+            val_geometry_loss = ckpt['val_geometry_velocity_mse']
 
             # Explicitly delete the loaded checkpoint to free up system/GPU memory
             del ckpt
-            torch.cuda.empty_cache()
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
 
             print('Epoch:\t', start_epoch)
-            print('MSE:\t', val_loss)
+            print('Val Geometry Velocity MSE:\t', val_geometry_loss)
             start_epoch += 1
         except Exception as e:
             raise SystemError(f'Load failed: {e}')
-    else:
-        text_normalizer, c_noise_scale = fit_text_normalizer()
 
     # 日志
-    if args.resume:
+    if resume:
         candidates = []
         if log_dir.exists():
             for p in log_dir.iterdir():
@@ -330,7 +280,7 @@ def main():
         resample=False,
     )
 
-    def decode(z, name, vae_model, sf, mean, ep):
+    def decode(z, name, vae_model, sf, mean):
         z = (z / sf + mean).detach().to(device).float()
 
         def decode_predictor(inputs: torch.Tensor) -> torch.Tensor:
@@ -359,7 +309,8 @@ def main():
         saver(recon[0].cpu(), meta_data={'filename_or_obj': f'{name}.nii.gz'})
         return recon.cpu()
 
-    amp_ctx = autocast(device.type) if use_amp else nullcontext()
+    def amp_context():
+        return autocast(device_type=device.type, enabled=use_amp) if use_amp else nullcontext()
 
     accumulated_samples = 0
     optimizer.zero_grad(set_to_none=True)
@@ -374,11 +325,11 @@ def main():
         # Losses are scaled by effective_batch_size during accumulation; rescale
         # the tail step so a partial final micro-batch still becomes a true mean.
         tail_scale = effective_batch_size / accumulated_count
-        for param in list(rflow.parameters()) + list(context_embedder.parameters()) + list(param_head.parameters()):
+        for param in trainable_params:
             if param.grad is not None:
                 param.grad *= tail_scale
 
-        torch.nn.utils.clip_grad_norm_(list(rflow.parameters()) + list(context_embedder.parameters()) + list(param_head.parameters()), 1.0)
+        torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
 
         if use_amp:
             scale_before = scaler.get_scale()
@@ -392,17 +343,14 @@ def main():
 
         if not step_skipped:
             rflow_ema.update(rflow)
-            context_ema.update(context_embedder)
-            param_ema.update(param_head)
+            condition_ema.update(condition_encoder)
 
         optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(start_epoch, num_epochs):
         rflow.train()
-        context_embedder.train()
-        param_head.train()
-        epoch_loss_y = 0
-        epoch_loss_c = 0
+        condition_encoder.train()
+        epoch_geometry_loss = 0
         step = 0
 
         pbar = tqdm(train_loader, desc=f'Epoch {epoch}/{num_epochs - 1}', disable=not progress_enabled)
@@ -411,87 +359,49 @@ def main():
             step += 1
 
             image = batch['image'].to(device, non_blocking=True)
-            cond = batch['condition'].to(device, non_blocking=True)
+            bone_latent = batch['condition'].to(device, non_blocking=True)
+            stem_model_id = batch['stem_model_id'].to(device, non_blocking=True)
+            stem_spec_id = batch['stem_spec_id'].to(device, non_blocking=True)
+            numerics = batch['numerics'].to(device, non_blocking=True)
+            masks = batch['masks'].to(device, non_blocking=True)
             current_bs = image.shape[0]
 
-            c_text_strs_true = []
-            c_text_strs_cond = []
-
+            current_bone = bone_latent.clone()
+            current_masks = masks.clone()
             for i in range(current_bs):
-                prob = random.random()
+                mode = random.choices(condition_modes, weights=condition_mode_weights, k=1)[0]
+                current_bone[i : i + 1], current_masks[i : i + 1] = define.apply_prosthesis_condition_mode(
+                    bone_latent[i : i + 1],
+                    masks[i : i + 1],
+                    mode,
+                )
 
-                ctx_str = batch['ctx_raw'][i] if 'ctx_raw' in batch else '{}'
-                ctx = json.loads(ctx_str)
-                true_text = define.generate_text(ctx, level='full')
-                c_text_strs_true.append(true_text)
-
-                if prob < 1 / 6:
-                    # 1/6: Drop Both (p(y,c))
-                    cond[i] = 0.0
-                    c_text_strs_cond.append('')
-                elif prob < 2 / 6:
-                    # 1/6: Drop c only (p(y,c|x))
-                    c_text_strs_cond.append('')
-                elif prob < 3 / 6:
-                    # 1/6: Drop x only (p(y,c|c_full))
-                    cond[i] = 0.0
-                    c_text_strs_cond.append(true_text)
-                elif prob < 4 / 6:
-                    # 1/6: Partial c - Model only (p(y,c|x, c_model))
-                    c_text_strs_cond.append(define.generate_text(ctx, level='model'))
-                elif prob < 5 / 6:
-                    # 1/6: Partial c - Model & Size (p(y,c|x, c_model_size))
-                    c_text_strs_cond.append(define.generate_text(ctx, level='model_size'))
-                else:
-                    # 1/6: Keep Both (p(y,c|x, c_full))
-                    c_text_strs_cond.append(true_text)
-
-            with torch.no_grad():
-                c_text_all = text_normalizer(encode_texts(c_text_strs_true + c_text_strs_cond))
-                c_text_true, c_text_cond = c_text_all.chunk(2, dim=0)
-
-            with amp_ctx:
+            with amp_context():
                 # 采样时间步
                 timesteps = scheduler.sample_timesteps(image)
 
-                # 获取加噪比例
-                t_val = (timesteps.float() / scheduler.num_train_timesteps).view(-1, 1).to(device)
-
-                # 设计妥协说明：移除了 valid_mask。因为训练数据已在离线对齐 32 整数倍，且 batch_size = 1，无批次内 padding。
-                noise_y = torch.randn_like(image)
+                # 训练数据已离线对齐，且 batch_size = 1；此处不再需要运行时 padding mask。
+                noise = torch.randn_like(image)
 
                 # RFM 加噪过程
-                noisy_image = scheduler.add_noise(original_samples=image, noise=noise_y, timesteps=timesteps)
+                noisy_image = scheduler.add_noise(original_samples=image, noise=noise, timesteps=timesteps)
 
-                # 参数流状态始终由完整真实参数加噪得到；随机丢弃后的参数仅作为条件注入 UNet。
-                noise_c = torch.randn_like(c_text_true) * c_noise_scale
-                c_t = t_val * c_text_true + (1.0 - t_val) * noise_c
+                # 结构化假体条件 tokens [B, 6, C]
+                condition_tokens = condition_encoder(stem_model_id, stem_spec_id, numerics, current_masks)
 
-                # 生成全局条件 Embeddings [B, 6, C]
-                context = context_embedder(c_text_cond)
+                # 拼接加噪假体潜变量与术前骨骼潜变量
+                input_tensor = torch.cat([noisy_image, current_bone], dim=1)
 
-                # 拼接输入 (Image + Pre-op Condition)
-                input_tensor = torch.cat([noisy_image, cond], dim=1)
+                # 预测假体潜变量速度，并通过交叉注意力注入结构化条件
+                velocity_pred = rflow(x=input_tensor, timesteps=timesteps, context=condition_tokens)
 
-                # 预测速度 (Velocity), 注入 Context
-                velocity_y_pred = rflow(x=input_tensor, timesteps=timesteps, context=context)
-                velocity_c_pred = param_head(x=input_tensor, timesteps=timesteps, c_t=c_t)
+                target_velocity = image - noise
 
-                # 计算目标速度 (预测真实的 c_text_true)
-                target_velocity_y = image - noise_y
-                target_velocity_c = c_text_true - noise_c
-
-                # 联合损失函数计算
-                loss_y = torch.nn.functional.mse_loss(velocity_y_pred.float(), target_velocity_y.float(), reduction='mean')
-                loss_c = torch.nn.functional.mse_loss(velocity_c_pred.float(), target_velocity_c.float(), reduction='mean')
-
-                # 将两者简单相加，纯粹是为了让 PyTorch 能在一次 backward() 中同时向两个完全独立的网络派发梯度，提升计算效率，数值本身无物理意义
-                loss = loss_y + loss_c
-                disp_loss_y = loss_y.item()
-                disp_loss_c = loss_c.item()
+                geometry_loss = torch.nn.functional.mse_loss(velocity_pred.float(), target_velocity.float(), reduction='mean')
+                disp_geometry_loss = geometry_loss.item()
 
                 # 动态梯度累积缩放 (根据当前真实 bs 与期望有效 bs 的比例缩放 loss)
-                micro_loss = loss * (current_bs / effective_batch_size)
+                micro_loss = geometry_loss * (current_bs / effective_batch_size)
 
                 if use_amp:
                     scaler.scale(micro_loss).backward()
@@ -504,144 +414,100 @@ def main():
                 optimizer_step(accumulated_samples)
                 accumulated_samples = 0
 
-            epoch_loss_y += disp_loss_y
-            epoch_loss_c += disp_loss_c
+            epoch_geometry_loss += disp_geometry_loss
 
             if step % 1 == 0:
                 global_step = epoch * len(train_loader) + step
-                writer.add_scalar('train/loss_y', disp_loss_y, global_step)
-                writer.add_scalar('train/loss_c', disp_loss_c, global_step)
+                writer.add_scalar('loss/geometry_velocity_mse_train_step', disp_geometry_loss, global_step)
 
             if progress_enabled:
-                pbar.set_postfix({'loss_y': f'{disp_loss_y:.4f}', 'loss_c': f'{disp_loss_c:.4f}'})
+                pbar.set_postfix({'geom_mse': f'{disp_geometry_loss:.4f}'})
 
         # Flush the final partial accumulation before validation/checkpointing.
         if accumulated_samples > 0:
             optimizer_step(accumulated_samples)
             accumulated_samples = 0
 
-        writer.add_scalar('train/epoch_loss_y', epoch_loss_y / step, epoch)
-        writer.add_scalar('train/epoch_loss_c', epoch_loss_c / step, epoch)
+        writer.add_scalar('loss/geometry_velocity_mse_train_epoch', epoch_geometry_loss / step, epoch)
 
         # 验证与采样 (保持 BS=1，不需要改 collate_fn)
         if epoch % val_interval == 0:
             rflow.eval()
-            context_embedder.eval()
-            param_head.eval()
+            condition_encoder.eval()
             rflow_ema.store(rflow)
             rflow_ema.copy_to(rflow)
-            context_ema.store(context_embedder)
-            context_ema.copy_to(context_embedder)
-            param_ema.store(param_head)
-            param_ema.copy_to(param_head)
+            condition_ema.store(condition_encoder)
+            condition_ema.copy_to(condition_encoder)
 
-            val_loss_y_sum = 0
-            val_loss_c_sum = 0
-            val_cos_sim_v_sum = 0
-            val_cos_sim_vt_sum = 0
+            val_geometry_loss_sums = {mode: 0.0 for mode in condition_modes}
             val_steps = 0
 
             with torch.no_grad():
                 for val_idx, batch in enumerate(val_bar := tqdm(val_loader, desc='Val', disable=not progress_enabled)):
                     image = batch['image'].to(device)
-                    cond = batch['condition'].to(device)
-
-                    c_text_strs = []
-                    for b in range(image.shape[0]):
-                        ctx_str = batch['ctx_raw'][b] if 'ctx_raw' in batch else '{}'
-                        ctx = json.loads(ctx_str)
-                        c_text_strs.append(define.generate_text(ctx, level='full'))
-
-                    with torch.no_grad():
-                        c_text = text_normalizer(encode_texts(c_text_strs))
+                    bone_latent = batch['condition'].to(device)
+                    stem_model_id = batch['stem_model_id'].to(device)
+                    stem_spec_id = batch['stem_spec_id'].to(device)
+                    numerics = batch['numerics'].to(device)
+                    masks = batch['masks'].to(device)
 
                     timesteps = scheduler.sample_timesteps(image)
-                    t_val = (timesteps.float() / scheduler.num_train_timesteps).view(-1, 1).to(device)
 
-                    # 设计妥协说明：验证亦移除 valid_mask
-                    noise_y = torch.randn_like(image)
-                    noisy_image = scheduler.add_noise(original_samples=image, noise=noise_y, timesteps=timesteps)
+                    # 验证同样按单样本动态尺寸执行，不引入运行时 padding mask。
+                    noise = torch.randn_like(image)
+                    noisy_image = scheduler.add_noise(original_samples=image, noise=noise, timesteps=timesteps)
+                    target_velocity = image - noise
 
-                    noise_c = torch.randn_like(c_text) * c_noise_scale
-                    c_t = t_val * c_text + (1.0 - t_val) * noise_c
+                    for mode in condition_modes:
+                        current_bone, current_masks = define.apply_prosthesis_condition_mode(bone_latent, masks, mode)
+                        condition_tokens = condition_encoder(stem_model_id, stem_spec_id, numerics, current_masks)
+                        input_tensor = torch.cat([noisy_image, current_bone], dim=1)
 
-                    context = context_embedder(c_text)
-                    input_tensor = torch.cat([noisy_image, cond], dim=1)
+                        with amp_context():
+                            velocity_pred = rflow(input_tensor, timesteps, context=condition_tokens)
+                            geometry_loss = torch.nn.functional.mse_loss(velocity_pred.float(), target_velocity.float(), reduction='mean')
 
-                    with amp_ctx:
-                        velocity_y_pred = rflow(input_tensor, timesteps, context=context)
-                        velocity_c_pred = param_head(input_tensor, timesteps, c_t)
-
-                        target_velocity_y = image - noise_y
-                        target_velocity_c = c_text - noise_c
-
-                        loss_y = torch.nn.functional.mse_loss(velocity_y_pred.float(), target_velocity_y.float(), reduction='mean')
-                        loss_c = torch.nn.functional.mse_loss(velocity_c_pred.float(), target_velocity_c.float(), reduction='mean')
-
-                    val_loss_y_sum += loss_y.item()
-                    val_loss_c_sum += loss_c.item()
+                        val_geometry_loss_sums[mode] += geometry_loss.item()
                     val_steps += 1
-
-                    # 瞬时预测 c_data：基于 Flow Matching 的常微分方程式闭式解 (无需 50 步积分)
-                    c_pred = c_t + (1.0 - t_val) * velocity_c_pred
-                    batch_cos_sim_v = torch.nn.functional.cosine_similarity(c_pred, c_text, dim=1).mean().item()
-                    val_cos_sim_v_sum += batch_cos_sim_v
-
-                    # 50步精确评估 param_head：从随机 c_t 出发，沿真实 y_t 轨迹积分到 c_data。
-                    with torch.no_grad():
-                        scheduler.set_timesteps(num_inference_steps=50)
-                        temp_timesteps = scheduler.timesteps.to(device)
-                        temp_next_timesteps = torch.cat([temp_timesteps[1:], torch.zeros(1, dtype=temp_timesteps.dtype, device=device)])
-
-                        c_t_pred = torch.randn_like(c_text, generator=torch.Generator(device=device).manual_seed(42 + val_idx)) * c_noise_scale
-
-                        for t_s, next_t_s in zip(temp_timesteps, temp_next_timesteps):
-                            t_val_s = (t_s.float() / scheduler.num_train_timesteps).view(-1, 1).to(device)
-                            y_t_s = t_val_s * image + (1.0 - t_val_s) * noise_y
-                            with amp_ctx:
-                                v_c_pred_s = param_head(torch.cat([y_t_s, cond], dim=1), t_s[None].to(device).repeat(image.shape[0]), c_t_pred)
-                            c_t_pred, _ = scheduler.step(v_c_pred_s, t_s, c_t_pred, next_t_s)
-
-                    batch_cos_sim_vt = torch.nn.functional.cosine_similarity(c_t_pred, c_text, dim=1).mean().item()
-                    val_cos_sim_vt_sum += batch_cos_sim_vt
 
                     prl = batch['prl'][0]
                     if prl == val_prl:
                         name = f'{prl}_{val_idx}'
+                        current_bone, current_masks = define.apply_prosthesis_condition_mode(
+                            bone_latent,
+                            masks,
+                            'bone_prosthesis_full',
+                        )
+                        condition_tokens = condition_encoder(stem_model_id, stem_spec_id, numerics, current_masks)
 
                         scheduler.set_timesteps(num_inference_steps=50)
                         all_timesteps = scheduler.timesteps
                         all_next_timesteps = torch.cat((all_timesteps[1:], torch.tensor([0], dtype=all_timesteps.dtype, device=all_timesteps.device)))
 
                         generator = torch.Generator(device=device).manual_seed(42)
-                        # 设计妥协说明：移除 valid_mask 遮罩
                         generated = torch.randn(image.shape, device=device, generator=generator)
-                        generated_c = torch.randn(c_text.shape, device=device, generator=generator) * c_noise_scale
 
                         for t, next_t in zip(all_timesteps, all_next_timesteps):
                             if progress_enabled:
                                 val_bar.set_postfix({'RFlow': t.item()})
 
-                            with torch.no_grad(), amp_ctx:  # 使用 AMP 保护以减少显存占用并加速推理
+                            with torch.no_grad(), amp_context():
                                 t_input = t[None].to(device)
 
-                                current_context = context_embedder(c_text)
-                                model_input = torch.cat([generated, cond], dim=1)
+                                model_input = torch.cat([generated, current_bone], dim=1)
 
-                                velocity_y_pred = rflow(model_input, t_input, context=current_context)
-                                velocity_c_pred = param_head(model_input, t_input, generated_c)
+                                velocity_pred = rflow(model_input, t_input, context=condition_tokens)
 
                             with torch.no_grad():
-                                generated, _ = scheduler.step(velocity_y_pred, t, generated, next_t)
-                                generated_c, _ = scheduler.step(velocity_c_pred, t, generated_c, next_t)
+                                generated, _ = scheduler.step(velocity_pred, t, generated, next_t)
 
                         if progress_enabled:
                             val_bar.set_postfix({})
 
-                        with amp_ctx:
-                            vis_generated = decode(generated, f'{name}_val_epoch_{epoch:03d}_Gen', vae_image, image_sf, image_mean, epoch)
-                            vis_gt = decode(image, f'{name}_val_epoch_{epoch:03d}_GT', vae_image, image_sf, image_mean, epoch)
-                            vis_cond = decode(cond, f'{name}_val_epoch_{epoch:03d}_Cond', vae_cond, cond_sf, cond_mean, epoch)
+                        with amp_context():
+                            vis_generated = decode(generated, f'{name}_val_epoch_{epoch:03d}_GeneratedImplant', vae_image, image_sf, image_mean)
+                            vis_gt = decode(image, f'{name}_val_epoch_{epoch:03d}_TargetImplant', vae_image, image_sf, image_mean)
+                            vis_bone = decode(current_bone, f'{name}_val_epoch_{epoch:03d}_BoneCondition', vae_cond, cond_sf, cond_mean)
 
                         # DRR Visualization (Refer to VAE style)
                         axis = 1
@@ -658,15 +524,15 @@ def main():
 
                         drr_gen = get_drr_hstack(vis_generated)
                         drr_gt = get_drr_hstack(vis_gt)
-                        drr_cond = get_drr_hstack(vis_cond)
+                        drr_bone = get_drr_hstack(vis_bone)
 
-                        writer.add_image(f'val/{name}_Gen', drr_gen, epoch, dataformats='HWC')
-                        writer.add_image(f'val/{name}_GT', drr_gt, epoch, dataformats='HWC')
-                        writer.add_image(f'val/{name}_Cond', drr_cond, epoch, dataformats='HWC')
+                        writer.add_image(f'val_sample/{name}/generated_implant', drr_gen, epoch, dataformats='HWC')
+                        writer.add_image(f'val_sample/{name}/target_implant', drr_gt, epoch, dataformats='HWC')
+                        writer.add_image(f'val_sample/{name}/bone_condition', drr_bone, epoch, dataformats='HWC')
 
-                        Image.fromarray(drr_gen).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_Gen.png')
-                        Image.fromarray(drr_gt).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_GT.png')
-                        Image.fromarray(drr_cond).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_Cond.png')
+                        Image.fromarray(drr_gen).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_GeneratedImplant.png')
+                        Image.fromarray(drr_gt).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_TargetImplant.png')
+                        Image.fromarray(drr_bone).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_BoneCondition.png')
 
                         # Diff DRR (hstack)
                         diff_drrs = []
@@ -676,41 +542,29 @@ def main():
                             diff_drrs.append(np.flipud(drr_diff.transpose(1, 0, 2)))
 
                         drr_diff_hstack = np.hstack(diff_drrs)
-                        writer.add_image(f'val/Diff_{val_idx}', drr_diff_hstack, epoch, dataformats='HWC')
-                        Image.fromarray(drr_diff_hstack).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_Diff.png')
+                        writer.add_image(f'val_sample/{name}/absolute_error', drr_diff_hstack, epoch, dataformats='HWC')
+                        Image.fromarray(drr_diff_hstack).save(val_vis_dir / f'{name}_val_epoch_{epoch:03d}_AbsoluteError.png')
 
             rflow_ema.restore(rflow)
-            context_ema.restore(context_embedder)
-            param_ema.restore(param_head)
-            val_loss_y_avg = val_loss_y_sum / val_steps
-            val_loss_c_avg = val_loss_c_sum / val_steps
-            val_cos_sim_v_avg = val_cos_sim_v_sum / val_steps
-            val_cos_sim_vt_avg = val_cos_sim_vt_sum / val_steps
-            writer.add_scalar('val/loss_y', val_loss_y_avg, epoch)
-            writer.add_scalar('val/loss_c', val_loss_c_avg, epoch)
-            writer.add_scalar('val/c_cossim_v', val_cos_sim_v_avg, epoch)
-            writer.add_scalar('val/c_cossim_vt', val_cos_sim_vt_avg, epoch)
+            condition_ema.restore(condition_encoder)
+            val_geometry_loss_by_mode = {mode: val_geometry_loss_sums[mode] / val_steps for mode in condition_modes}
+            val_geometry_loss = val_geometry_loss_by_mode['bone_prosthesis_full']
+            writer.add_scalar('loss/geometry_velocity_mse_val_full_condition', val_geometry_loss, epoch)
+            for mode, loss_value in val_geometry_loss_by_mode.items():
+                writer.add_scalar(f'loss_by_condition/{mode}', loss_value, epoch)
 
-            print(
-                f'Val Loss Y: {val_loss_y_avg:11.4f} | Val Loss C: {val_loss_c_avg:11.4f} | '
-                f'Val CosSim(V): {val_cos_sim_v_avg:11.4f} | Val CosSim(Vt): {val_cos_sim_vt_avg:11.4f}'
-            )
+            val_loss_text = ' | '.join(f'{condition_mode_labels[mode]}: {value:.4f}' for mode, value in val_geometry_loss_by_mode.items())
+            print(f'Val Geometry MSE: {val_geometry_loss:11.4f} | {val_loss_text}')
 
             ckpt = {
                 'epoch': epoch,
                 'rflow_state': rflow.state_dict(),
                 'rflow_state_ema': rflow_ema.state_dict(),
-                'context_state': context_embedder.state_dict(),
-                'context_state_ema': context_ema.state_dict(),
-                'param_state': param_head.state_dict(),
-                'param_state_ema': param_ema.state_dict(),
+                'condition_encoder_state': condition_encoder.state_dict(),
+                'condition_encoder_state_ema': condition_ema.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'text_normalizer': text_normalizer.state_dict(),
-                'c_noise_scale': float(c_noise_scale.detach().cpu()),
-                'val_loss_y': val_loss_y_avg,
-                'val_loss_c': val_loss_c_avg,
-                'val_c_cossim_v': val_cos_sim_v_avg,
-                'val_c_cossim_vt': val_cos_sim_vt_avg,
+                'val_geometry_velocity_mse': val_geometry_loss,
+                'val_geometry_velocity_mse_by_mode': val_geometry_loss_by_mode,
             }
             if use_amp:
                 ckpt['scaler'] = scaler.state_dict()
@@ -719,7 +573,8 @@ def main():
 
             torch.save(ckpt, ckpt_dir / f'{task}_last.pt')
 
-        torch.cuda.empty_cache()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
     writer.close()
     print('Training Completed.')
