@@ -144,14 +144,13 @@ RFlow 生成器训练 1000 个 epoch 后，几何速度场 MSE 明显收敛。�
 ```mermaid
 flowchart TB
   %% Metal classifier
-  real_latent["真实假体几何潜变量"]
-  real_param["真实结构化假体参数"]
-  gen_param["真实参数条件"]
-  ext_param["扩展采样参数条件"]
+  real_latent["假体几何潜变量（真实域）"]
+  gen_param["假体参数条件（真实域）"]
+  ext_param["假体参数条件（扩展域）"]
 
-  rflow_gen["假体参数条件生成 RFlow"]
-  gen_latent["生成域假体几何潜变量"]
-  ext_latent["扩展域假体几何潜变量"]
+  rflow_gen["假体几何生成器 RFlow"]
+  gen_latent["假体几何潜变量（生成域）"]
+  ext_latent["假体几何潜变量（扩展域）"]
 
   metal_cls["假体参数判别器 3D CNN"]
   outputs["多头参数输出"]
@@ -163,8 +162,7 @@ flowchart TB
   ext_param --> rflow_gen --> ext_latent --> metal_cls
 
   metal_cls --> outputs
-  outputs -->|型号、规格、组件参数| loss_cls
-  real_param --> loss_cls
+  outputs -->|型号、规格、尺寸| loss_cls
   gen_param --> loss_cls
   ext_param --> loss_cls
   loss_cls --> score_cls
@@ -176,19 +174,33 @@ flowchart TB
 
 #### 结果评价
 
-TODO 真实域训练图
-
-![Generated-domain metal classifier balanced score](doc/metal_cls_generated_score.svg)
-
 判别器训练和验证包含真实域、生成域和扩展域三类数据。真实域来自术后 CT 提取的真实假体几何，能够反映临床常见假体分布，但受医院、术者、供应商和病例构成影响，型号与规格分布天然不均衡。生成域由 RFlow 在无骨骼条件下、按真实数据中出现过的假体参数条件合成假体几何，相当于对真实参数组合进行可控数据扩增，是当前判别器训练与评价的重点。扩展域进一步采样假体手册中允许但真实训练集中未充分出现的参数组合，主要用于检验模型在更宽参数空间中的外推能力。
 
-| 域 | 几何来源 | 假体参数条件 | 平均正确率 |
-|:---|:---|:---|---:|
-| 真实 | 术后 CT | 真实手术记录 | 0.4702 |
-| 生成 | RFlow 合成 | 真实手术记录过的参数组合 | 0.5358 |
-| 扩展 | RFlow 合成 | 理论参数全集 | 0.2278 |
+![Metal classifier training balanced score](doc/metal_cls_score_train.svg)
 
-生成域假体参数判别器采用 RFlow 在线合成样本训练，经两段连续训练至 epoch 555，并分别在生成域、真实域和扩展域验证。生成域训练 balanced score 最高达到 0.8595，末值为 0.8322；生成域验证最高达到 0.5358（epoch 425），末值为 0.5083；真实域和扩展域验证最高分别为 0.4702 和 0.2278。真实域训练判别器的对照结果将作为后续补充，以进一步评价生成式数据增广对判别器性能的实际贡献。
+训练曲线显示，真实域训练模型很快将训练 balanced score 提升至接近 1.0，而生成域训练模型最高为 0.8595；前者提示真实样本易被记忆，后者则反映在线生成样本具有更高的形态多样性和训练难度。
+
+![Metal classifier real-domain validation score](doc/metal_cls_score_val_real.svg)
+
+真实域验证显示，生成域训练模型在真实术后假体几何上的最佳 balanced score 达到 0.4702，高于真实域训练模型的 0.3383，提示生成式样本增广有助于缓解真实数据分布不均衡造成的泛化不足。
+
+![Metal classifier generated-domain validation score](doc/metal_cls_score_val_generated.svg)
+
+生成域验证是当前重点场景，直接评价判别器能否识别由 RFlow 在真实参数条件下合成的假体几何；生成域训练模型最高达到 0.5358，明显高于真实域训练模型的 0.3000。
+
+![Metal classifier extended-domain validation score](doc/metal_cls_score_val_extended.svg)
+
+扩展域验证用于观察参数空间外推能力。两种训练方式在该域均明显下降，但生成域训练模型仍高于真实域训练模型，说明当前模型对训练集中少见或未见参数组合仍然有限，生成器和判别器均需更充分的参数空间覆盖。
+
+| 验证域 | 几何来源 | 假体参数条件 | 真实域训练最佳 score | 生成域训练最佳 score |
+|:---|:---|:---|---:|---:|
+| 真实域 | 术后 CT | 真实手术记录 | 0.3383 | 0.4702 |
+| 生成域 | RFlow 合成 | 真实手术记录过的参数组合 | 0.3000 | ***0.5358** |
+| 扩展域 | RFlow 合成 | 理论参数全集 | 0.1393 | 0.2278 |
+
+> \*: 最终采用的最优模型
+
+总体来看，真实域训练模型在训练集上迅速接近饱和，但三类验证域均低于生成域训练模型；生成域训练模型虽然训练分数较低，却在真实域、生成域和扩展域验证中均取得更高最佳 score。该对比更直接支持 RFlow 在线合成样本作为数据增广来源，对假体参数判别器的泛化性能具有实际帮助。因此，最终采用生成域训练模型作为假体参数判别器。
 
 ## 临床可用性测试
 
@@ -198,7 +210,7 @@ TODO 真实域训练图
 
 除统计分布评价之外，还可采用更贴近临床医生思维习惯的评价方式，例如分析生成假体的骨皮质穿透率、髓腔有效填充率、接触初始稳定性、骨覆盖率等显式指标，并结合人类专家主观评测，综合评价生成结果的临床可行性。
 
-TODO
+**TODO**
 
 ## 数据集
 
