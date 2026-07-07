@@ -182,11 +182,11 @@ flowchart TB
 
 ![Metal classifier real-domain validation score](doc/metal_cls_score_val_real.svg)
 
-真实域验证显示，生成域训练模型在真实术后假体几何上的最佳 balanced score 达到 0.4702，高于真实域训练模型的 0.3383，提示生成式样本增广有助于缓解真实数据分布不均衡造成的泛化不足。
+真实域验证显示，生成域训练模型在真实术后假体几何上的最佳 balanced score 达到 0.4702，高于真实域训练模型的 0.3341，提示生成式样本增广有助于缓解真实数据分布不均衡造成的泛化不足。
 
 ![Metal classifier generated-domain validation score](doc/metal_cls_score_val_generated.svg)
 
-生成域验证是当前重点场景，直接评价判别器能否识别由 RFlow 在真实参数条件下合成的假体几何；生成域训练模型最高达到 0.5358，明显高于真实域训练模型的 0.3000。
+生成域验证是当前重点场景，直接评价判别器能否识别由 RFlow 在真实参数条件下合成的假体几何；生成域训练模型最高达到 0.5358，明显高于真实域训练模型的 0.3086。
 
 ![Metal classifier extended-domain validation score](doc/metal_cls_score_val_extended.svg)
 
@@ -194,8 +194,8 @@ flowchart TB
 
 | 验证域 | 几何来源 | 假体参数条件 | 真实域训练最佳 score | 生成域训练最佳 score |
 |:---|:---|:---|---:|---:|
-| 真实域 | 术后 CT | 真实手术记录 | 0.3383 | 0.4702 |
-| 生成域 | RFlow 合成 | 真实手术记录过的参数组合 | 0.3000 | **0.5358**\* |
+| 真实域 | 术后 CT | 真实手术记录 | 0.3341 | 0.4702 |
+| 生成域 | RFlow 合成 | 真实手术记录过的参数组合 | 0.3086 | **0.5358**\* |
 | 扩展域 | RFlow 合成 | 理论参数全集 | 0.1459 | 0.2278 |
 
 > \*: 最优模型，epoch = 425
