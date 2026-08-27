@@ -1,3 +1,4 @@
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 from typing import cast
@@ -6,223 +7,107 @@ import itk
 import numpy as np
 import torch
 from monai.inferers import sliding_window_inference
-from monai.networks.nets import AutoencoderKL, DiffusionModelUNet
-from monai.networks.schedulers import RFlowScheduler
 from monai.transforms import CenterSpatialCrop, Compose, DivisiblePadd, EnsureChannelFirstd, Lambdad, LoadImaged, SpatialPadd
 from torch import autocast
 
-FEMORAL = {
-    '': [''],
-    'DePuy Corail': [
-        '',
-        '8 (标准无领)',
-        '9 (标准无领)',
-        '10 (标准无领)',
-        '11 (标准无领)',
-        '12 (标准无领)',
-        '13 (标准无领)',
-        '14 (标准无领)',
-        '15 (标准无领)',
-        '16 (标准无领)',
-        '18 (标准无领)',
-        '20 (标准无领)',
-        '8 (标准带领)',
-        '9 (标准带领)',
-        '10 (标准带领)',
-        '11 (标准带领)',
-        '12 (标准带领)',
-        '13 (标准带领)',
-        '14 (标准带领)',
-        '15 (标准带领)',
-        '16 (标准带领)',
-        '18 (标准带领)',
-        '20 (标准带领)',
-        '9 (高偏心无领)',
-        '10 (高偏心无领)',
-        '11 (高偏心无领)',
-        '12 (高偏心无领)',
-        '13 (高偏心无领)',
-        '14 (高偏心无领)',
-        '15 (高偏心无领)',
-        '16 (高偏心无领)',
-        '9 (内翻带领)',
-        '10 (内翻带领)',
-        '11 (内翻带领)',
-        '12 (内翻带领)',
-        '13 (内翻带领)',
-        '14 (内翻带领)',
-        '15 (内翻带领)',
-        '16 (内翻带领)',
-        '18 (内翻带领)',
-        '20 (内翻带领)',
-        '6 (DDH)',
-        '10 (翻修标准)',
-        '11 (翻修标准)',
-        '12 (翻修标准)',
-        '13 (翻修标准)',
-        '14 (翻修标准)',
-        '15 (翻修标准)',
-        '16 (翻修标准)',
-        '18 (翻修标准)',
-        '20 (翻修标准)',
-        '10 (翻修高偏心)',
-        '11 (翻修高偏心)',
-        '12 (翻修高偏心)',
-        '13 (翻修高偏心)',
-        '14 (翻修高偏心)',
-        '15 (翻修高偏心)',
-        '16 (翻修高偏心)',
-        '18 (翻修高偏心)',
-        '20 (翻修高偏心)',
-    ],
-    'DePuy Tri-Lock': ['', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'],
-    'DePuy SUMMIT': ['', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
-    'DePuy S-ROM': ['', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20'],
-    'Stryker Accolade TMZF': [
-        '',
-        '0 (127°)',
-        '1 (127°)',
-        '2 (127°)',
-        '2.5 (127°)',
-        '3 (127°)',
-        '3.5 (127°)',
-        '4 (127°)',
-        '4.5 (127°)',
-        '5 (127°)',
-        '5.5 (127°)',
-        '6 (127°)',
-        '7 (127°)',
-        '8 (127°)',
-        '0 (132°)',
-        '1 (132°)',
-        '2 (132°)',
-        '2.5 (132°)',
-        '3 (132°)',
-        '3.5 (132°)',
-        '4 (132°)',
-        '4.5 (132°)',
-        '5 (132°)',
-        '5.5 (132°)',
-        '6 (132°)',
-        '7 (132°)',
-        '8 (132°)',
-    ],
-    'Stryker Accolade II': [
-        '',
-        '0 (127°)',
-        '1 (127°)',
-        '2 (127°)',
-        '3 (127°)',
-        '4 (127°)',
-        '5 (127°)',
-        '6 (127°)',
-        '7 (127°)',
-        '8 (127°)',
-        '9 (127°)',
-        '10 (127°)',
-        '11 (127°)',
-        '0 (132°)',
-        '1 (132°)',
-        '2 (132°)',
-        '3 (132°)',
-        '4 (132°)',
-        '5 (132°)',
-        '6 (132°)',
-        '7 (132°)',
-        '8 (132°)',
-        '9 (132°)',
-        '10 (132°)',
-        '11 (132°)',
-    ],
-    'Stryker Secur-Fit': [
-        '',
-        '6 (127°)',
-        '7 (127°)',
-        '8 (127°)',
-        '9 (127°)',
-        '10 (127°)',
-        '11 (127°)',
-        '12 (127°)',
-        '13 (127°)',
-        '4 (132°)',
-        '5 (132°)',
-        '6 (132°)',
-        '7 (132°)',
-        '8 (132°)',
-        '9 (132°)',
-        '10 (132°)',
-        '11 (132°)',
-        '12 (132°)',
-        '13 (132°)',
-        '14 (132°)',
-    ],
-    'Wright Profemur': ['', '1', '2', '3', '4', '5', '6', '7', '8', '9'],
-    'Smith & Nephew Synergy': ['', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'],
-    'Smith & Nephew Anthology': ['', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'],
-    'Smith & Nephew Plus-TS': ['', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
-    'Zimmer M/L Taper': ['', '4', '5', '6', '7.5', '9', '10', '11', '12.5', '13.5', '15', '16.25', '17.5', '20', '22.5', 'ML'],
-    'Zimmer CLS Spotorno': ['', '5', '6', '7', '8', '9', '10', '11.25', '12.5', '13.75', '15', '16.25'],
-    'AK Medical ML-TP': ['', '1', '2', '2.5', '3', '3.5', '4', '5', '6'],
-    'Waldemar Link LCU': [
-        '',
-        '7',
-        '8',
-        '9',
-        '10',
-        '11',
-        '12',
-        '13',
-        '14',
-        '15',
-        '16',
-        '17',
-        '18',
-        '19',
-        '20',
-        '21',
-        '22',
-        '23',
-        '24',
-        '25',
-        '26',
-        '27',
-        '28',
-    ],
-    'Keyi Bangen SQKA': ['', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10'],
-    'Zimmer CPT': ['', '0', '1', '2', '3', '4', '5', 'Long Size 2', 'Long Size 3', 'Long Size 4'],
-    'Zimmer Wagner SL': ['', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '24', '25', '26', '27', '28', '29', '30'],
-    'Wagner Cone': [
-        '',
-        '13 (125°)',
-        '14 (125°)',
-        '15 (125°)',
-        '16 (125°)',
-        '17 (125°)',
-        '18 (125°)',
-        '19 (125°)',
-        '20 (125°)',
-        '21 (125°)',
-        '22 (125°)',
-        '13 (135°)',
-        '14 (135°)',
-        '15 (135°)',
-        '16 (135°)',
-        '17 (135°)',
-        '18 (135°)',
-        '19 (135°)',
-        '20 (135°)',
-        '21 (135°)',
-        '22 (135°)',
-    ],
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import define  # noqa: E402
+
+NUMERIC_LABEL_NAMES = ('cup_outer', 'head_outer', 'head_offset', 'liner_offset')
+NUMERIC_CLASS_STEPS = {
+    'cup_outer': 2.0,
+    'head_outer': 2.0,
+    'head_offset': 0.5,
 }
 
-BRANDS = sorted(list(FEMORAL.keys()))
-SIZES = sorted(list({s for sizes in FEMORAL.values() for s in sizes}))
+CONDITION_MODE_LABELS = {
+    'unconditional': '完全无条件',
+    'bone_only': '仅骨骼条件',
+    'prosthesis_full_only': '仅假体全参数',
+    'bone_stem_model': '骨骼 + 柄型号',
+    'bone_stem_model_spec': '骨骼 + 柄型号规格',
+    'bone_prosthesis_full': '骨骼 + 假体全参数',
+}
+CONDITION_MODE_PARAM_LEVEL = {
+    'unconditional': None,
+    'bone_only': None,
+    'prosthesis_full_only': 'full',
+    'bone_stem_model': 'model',
+    'bone_stem_model_spec': 'model_spec',
+    'bone_prosthesis_full': 'full',
+}
 
-CUP_OUTER = [38.0, 62.0, 44.0, 2.0]
-HEAD_OUTER = [22.0, 44.0, 32.0, 2.0]
-HEAD_OFFSET = [-5.0, 9.0, 0.0, 1.0]
-LINER_OFFSET = [0.0, 6.0, 0.0, 1.0]
+STEM_MODELS = tuple(model for model in define.FEMORAL_STEM_MODELS if define._has_context_value(model))
+
+
+def specs_for_model(model):
+    return tuple(size for size in define.FEMORAL.get(model, []) if define._has_context_value(size))
+
+
+def build_numeric_bins():
+    bins = {}
+    for name in NUMERIC_LABEL_NAMES:
+        if name == 'liner_offset':
+            bins[name] = (0.0, 4.0)
+            continue
+        min_value, max_value = define.PROSTHESIS_NUMERIC_RANGES[name]
+        step = NUMERIC_CLASS_STEPS[name]
+        bins[name] = tuple(float(x) for x in np.arange(min_value, max_value + 1e-6, step))
+    return bins
+
+
+NUMERIC_OPTIONS = build_numeric_bins()
+NUMERIC_FALLBACKS = {
+    'cup_outer': 50.0,
+    'head_outer': 32.0,
+    'head_offset': 0.0,
+    'liner_offset': 0.0,
+}
+
+
+def build_stem_spec_model_mask(device):
+    mask = torch.zeros((len(define.FEMORAL_STEM_MODELS), len(define.FEMORAL_STEM_SPECS)), dtype=torch.bool, device=device)
+    model_to_id = {model: i for i, model in enumerate(define.FEMORAL_STEM_MODELS)}
+    for spec_id, (model, size) in enumerate(define.FEMORAL_STEM_SPECS):
+        if define._has_context_value(model) and define._has_context_value(size):
+            mask[model_to_id[model], spec_id] = True
+    return mask
+
+
+class MetalGeometryCls(torch.nn.Module):
+    def __init__(self, numeric_class_counts):
+        super().__init__()
+        channels = (8, 32, 64, 128, 192, 256)
+        blocks = []
+        for in_ch, out_ch in zip(channels[:-1], channels[1:]):
+            blocks.extend([
+                torch.nn.Conv3d(in_ch, out_ch, kernel_size=3, stride=2, padding=1),
+                torch.nn.GroupNorm(num_groups=min(32, out_ch), num_channels=out_ch),
+                torch.nn.SiLU(),
+            ])
+        self.backbone = torch.nn.Sequential(*blocks)
+        self.pool = torch.nn.AdaptiveAvgPool3d(1)
+        self.neck = torch.nn.Sequential(
+            torch.nn.Linear(channels[-1], 256),
+            torch.nn.SiLU(),
+            torch.nn.Dropout(0.1),
+        )
+        self.stem_model = torch.nn.Linear(256, len(define.FEMORAL_STEM_MODELS))
+        self.stem_spec = torch.nn.Linear(256, len(define.FEMORAL_STEM_SPECS))
+        self.numeric_heads = torch.nn.ModuleDict({name: torch.nn.Linear(256, count) for name, count in numeric_class_counts.items()})
+
+    def forward(self, image):
+        feat = self.backbone(image)
+        feat = self.pool(feat).flatten(1)
+        feat = self.neck(feat)
+        return {
+            'stem_model': self.stem_model(feat),
+            'stem_spec': self.stem_spec(feat),
+            **{name: head(feat) for name, head in self.numeric_heads.items()},
+        }
 
 
 def bone_normalize(ct_value: float) -> float:
@@ -243,290 +128,212 @@ def _printf(*args):
     print(*args)
 
 
-def parse_context(brands, sizes, stem_brand=None, stem_size=None, cup_outer=None, head_outer=None, head_offset=None, liner_offset=None):
-    import torch
+def _device(cpu=False):
+    if cpu:
+        return torch.device('cpu')
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    brand_to_id = {b: i for i, b in enumerate(brands)}
-    size_to_id = {s: i for i, s in enumerate(sizes)}
 
-    brand_val = stem_brand if stem_brand is not None else ''
-    size_val = stem_size if stem_size is not None else ''
+def _optional_float(value):
+    if not define._has_context_value(value):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
 
-    if size_val and not brand_val:
-        raise ValueError('Cannot specify stem_size without specifying stem_brand.')
 
-    if brand_val not in FEMORAL:
-        raise ValueError(f"Unknown stem_brand: '{brand_val}'. Supported brands are: {list(FEMORAL.keys())}")
+def nearest_numeric(value, options, fallback=None):
+    options = tuple(options)
+    if not options:
+        return fallback
+    if value is None:
+        return fallback if fallback in options or fallback is None else options[len(options) // 2]
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return fallback if fallback in options else options[0]
+    return min(options, key=lambda item: abs(float(item) - value))
 
-    if size_val not in FEMORAL[brand_val]:
-        raise ValueError(f"Unknown stem_size: '{size_val}' for brand '{brand_val}'. Supported sizes are: {FEMORAL[brand_val]}")
 
-    brand_id = brand_to_id.get(brand_val, 0)
-    brand_mask = 1.0 if brand_val in brand_to_id else 0.0
+def case_prosthesis_values(ctx):
+    ctx = ctx or {}
+    femoral_spec = define._get_context_sequence(ctx, 'femoral_spec', 2)
+    stem_model = femoral_spec[0] if define._has_context_value(femoral_spec[0]) else None
+    stem_size = femoral_spec[1] if define._has_context_value(femoral_spec[1]) else None
+    return {
+        'stem_model': stem_model if stem_model in STEM_MODELS else None,
+        'stem_size': stem_size if stem_model in define.FEMORAL and stem_size in specs_for_model(stem_model) else None,
+        'cup_outer': _optional_float(define._get_context_value(ctx, 'cup_outer')),
+        'head_outer': _optional_float(define._get_context_value(ctx, 'head_outer')),
+        'head_offset': _optional_float(define._get_context_value(ctx, 'head_offset')),
+        'liner_offset': _optional_float(ctx.get('liner_offset')),
+    }
 
-    size_id = size_to_id.get(size_val, 0)
-    size_mask = 1.0 if size_val in size_to_id else 0.0
 
-    def min_max_scale(val, min_val, max_val):
-        if val is None or val == '':
-            return 0.0, 0.0
-        return 2.0 * (float(val) - min_val) / (max_val - min_val) - 1.0, 1.0
+def format_condition_desc(mode=None, stem_model=None, stem_size=None, cup_outer=None, head_outer=None, head_offset=None, liner_offset=None, seed=None):
+    parts = []
+    mode_label = CONDITION_MODE_LABELS.get(mode, mode)
+    if mode_label:
+        parts.append(mode_label)
+    if define._has_context_value(stem_model):
+        parts.append(f'柄型号 {stem_model}')
+    if define._has_context_value(stem_size):
+        parts.append(f'柄规格 {stem_size}')
+    if cup_outer is not None:
+        parts.append(f'杯直径 {float(cup_outer):.0f}')
+    if head_outer is not None:
+        parts.append(f'头直径 {float(head_outer):.0f}')
+    if head_offset is not None:
+        parts.append(f'头偏距 {float(head_offset):+g}')
+    if liner_offset is not None:
+        parts.append(f'衬偏心 {float(liner_offset):g}')
+    if seed is not None:
+        parts.append(f'种子 {seed}')
+    return ' '.join(parts)
 
-    cup_outer_val, cup_outer_mask = min_max_scale(cup_outer, *CUP_OUTER[:2])
-    head_outer_val, head_outer_mask = min_max_scale(head_outer, *HEAD_OUTER[:2])
-    head_offset_val, head_offset_mask = min_max_scale(head_offset, *HEAD_OFFSET[:2])
-    liner_offset_val, liner_offset_mask = min_max_scale(liner_offset, *LINER_OFFSET[:2])
 
-    nums = [cup_outer_val, head_outer_val, head_offset_val, liner_offset_val]
-    masks = [brand_mask, size_mask, cup_outer_mask, head_outer_mask, head_offset_mask, liner_offset_mask]
-
-    return (
-        torch.tensor([brand_id], dtype=torch.long),
-        torch.tensor([size_id], dtype=torch.long),
-        torch.tensor([nums], dtype=torch.float32),
-        torch.tensor([masks], dtype=torch.float32),
-    )
+def _amp_context(device, amp):
+    if amp and device.type != 'cpu':
+        return autocast(device.type)
+    return nullcontext()
 
 
 def diff_dmc(volume, origin, spacing, direction, threshold):
     """
     volume: [X, Y, Z] torch.Tensor
     """
-    import torch
     import trimesh
     from diso import DiffDMC
 
-    # volume 传入时应确保是 GPU Tensor 且为 float32
-    # 这里的 -threshold 是因为 DiffDMC 默认找正值区域
     vertices, indices = DiffDMC(dtype=torch.float32)(-volume, None, isovalue=-threshold)
     vertices, indices = vertices.cpu().numpy(), indices.cpu().numpy()
 
-    # volume.shape 是 (X, Y, Z)
-    # vertices 对应索引 [x, y, z] 归一化在 [0, 1] 之间
     I = vertices * (np.array(volume.shape) - 1)
 
     direction = np.array(direction)[:3, :3]
     spacing = np.array(spacing)[:3]
 
-    # 物理坐标 = origin + direction * (I * spacing)
     physical = (I * spacing) @ direction.T + origin
     return trimesh.Trimesh(physical, indices)
 
 
-class ContextEmbedder(torch.nn.Module):
-    """将手术设计参数编码为全局条件向量序列 [B, 6, C]"""
-
-    def __init__(self, brands, sizes, embed_dim=256):
-        super().__init__()
-        self.brand_emb = torch.nn.Embedding(len(brands), embed_dim)
-        self.size_emb = torch.nn.Embedding(len(sizes), embed_dim)
-
-        self.cup_outer_proj = torch.nn.Linear(1, embed_dim)
-        self.head_outer_proj = torch.nn.Linear(1, embed_dim)
-        self.head_offset_proj = torch.nn.Linear(1, embed_dim)
-        self.liner_offset_proj = torch.nn.Linear(1, embed_dim)
-
-    def forward(self, brand_id, size_id, numerics, masks=None):
-        brand_embed = self.brand_emb(brand_id)  # [B, C]
-        size_embed = self.size_emb(size_id)  # [B, C]
-
-        cup_outer_embed = self.cup_outer_proj(numerics[:, 0:1])  # [B, C]
-        head_outer_embed = self.head_outer_proj(numerics[:, 1:2])  # [B, C]
-        head_offset_embed = self.head_offset_proj(numerics[:, 2:3])  # [B, C]
-        liner_offset_embed = self.liner_offset_proj(numerics[:, 3:4])  # [B, C]
-
-        out = torch.stack([brand_embed, size_embed, cup_outer_embed, head_outer_embed, head_offset_embed, liner_offset_embed], dim=1)
-
-        if masks is not None:
-            out = out * masks.unsqueeze(-1)
-
-        return out
+def _release_weight(filename, override=None):
+    path = Path(override) if override else Path(__file__).parent / filename
+    if not path.is_file():
+        raise SystemError(f'Not found:\t {path.resolve()}')
+    return path
 
 
-def i1_load_models(vae_pre_path=None, vae_metal_path=None, rflow_path=None, cpu=False, printf=_printf):
-    if cpu:
-        device = torch.device('cpu')
-    else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+def i1_load_models(
+    vae_pre_path=None,
+    vae_metal_path=None,
+    rflow_path=None,
+    metal_cls_path=None,
+    cpu=False,
+    printf=_printf,
+):
+    device = _device(cpu)
     printf('Device:\t {0}'.format(device))
 
-    # 加载 VAE 模型 (AutoencoderKL)
     vae_dual = []
-    for subtask in ('pre', 'metal'):
-        arg = {'pre': vae_pre_path, 'metal': vae_metal_path}.get(subtask)
-        if arg is None:
-            f = Path(__file__).parent / f'vae_{subtask}_best.pt'
-        else:
-            f = Path(arg)
+    for subtask, override in (('pre', vae_pre_path), ('metal', vae_metal_path)):
+        weight = _release_weight(f'vae_{subtask}_best.pt', override)
+        printf('VAE:\t [{0}] {1}'.format(subtask, weight.resolve()))
 
-        if not f.exists():
-            raise SystemError(f'Not found:\t {f.resolve()}')
-        else:
-            printf('VAE:\t [{0}] {1}'.format(subtask, f.resolve()))
-
-        # 加载模型
-        loaded = torch.load(f, map_location='cpu', weights_only=False)
-
+        loaded = torch.load(weight, map_location='cpu', weights_only=False)
         printf('Epoch:\t', loaded['epoch'])
         printf('Channels:\t', channels := loaded['channels'])
         printf('Scale Factor:\t', loaded['scale_factor'])
         printf('Global Mean:\t', loaded['global_mean'])
 
-        # 初始化 VAE 网络结构
-        vae_model = AutoencoderKL(
-            spatial_dims=3,
-            in_channels=channels,
-            out_channels=channels,
-            num_res_blocks=(2, 2, 2),
-            channels=(32, 64, 128),
-            attention_levels=(False, False, False),
-            with_encoder_nonlocal_attn=False,
-            with_decoder_nonlocal_attn=False,
-            latent_channels=4,
-            norm_num_groups=32,
-            use_checkpoint=True,
-        ).to(device)
-
-        # 加载权重
+        vae_model = define.vae_kl(channels).to(device)
         vae_model.load_state_dict(loaded['state_dict'])
         vae_model.eval().float()
         printf('Param:\t {0:.2f} B'.format(sum(p.numel() for p in vae_model.parameters()) / 1e9))
-
         vae_dual.append((vae_model, loaded['scale_factor'], loaded['global_mean'], loaded['channels']))
 
-    # 加载 RFlow 模型 (DiffusionModelUNet)
-    if rflow_path is None:
-        rflow_path = Path(__file__).parent / 'rflow_last.pt'
-    else:
-        rflow_path = Path(rflow_path)
+    rflow_weight = _release_weight('rflow_last.pt', rflow_path)
+    rflow_ckpt = torch.load(rflow_weight, map_location=device, weights_only=False)
+    if 'condition_encoder_state_ema' not in rflow_ckpt and 'condition_encoder_state' not in rflow_ckpt:
+        raise SystemError(f'{rflow_weight.resolve()} is not a StructuredProsthesisConditionEncoder checkpoint.')
 
-    if not rflow_path.exists():
-        raise SystemError(f'Not found:\t {rflow_path.resolve()}')
-    else:
-        printf('RFlow:\t {0}'.format(rflow_path.resolve()))
+    printf('RFlow:\t {0}'.format(rflow_weight.resolve()))
+    printf('Epoch:\t {0}'.format(rflow_ckpt['epoch']))
 
-    loaded = torch.load(rflow_path, map_location=device)
-    printf('Epoch:\t {0}'.format(loaded['epoch']))
+    rflow_model = define.rflow_unet(context_embedding_size=256).to(device)
+    condition_encoder = define.StructuredProsthesisConditionEncoder(embed_dim=256).to(device)
 
-    rflow_model = DiffusionModelUNet(
-        spatial_dims=3,
-        in_channels=12,
-        out_channels=8,
-        num_res_blocks=(2, 2, 2),
-        channels=(96, 192, 384),
-        attention_levels=(False, False, True),
-        norm_num_groups=32,
-        with_conditioning=True,
-        transformer_num_layers=2,
-        cross_attention_dim=256,
-        use_flash_attention=not cpu,
-    ).to(device)
-
-    printf('Param:\t {0:.2f} B'.format(sum(p.numel() for p in rflow_model.parameters()) / 1e9))
-
-    context_embedder = ContextEmbedder(brands=BRANDS, sizes=SIZES, embed_dim=256).to(device)
-
-    if 'rflow_state_ema' in loaded:
-        rflow_model.load_state_dict(loaded['rflow_state_ema'])
+    rflow_state = rflow_ckpt.get('rflow_state_ema', rflow_ckpt['rflow_state'])
+    encoder_state = rflow_ckpt.get('condition_encoder_state_ema', rflow_ckpt['condition_encoder_state'])
+    rflow_model.load_state_dict(rflow_state)
+    condition_encoder.load_state_dict(encoder_state)
+    if 'rflow_state_ema' in rflow_ckpt:
         printf('Loaded RFlow EMA weights.')
-    elif 'rflow_state' in loaded:
-        rflow_model.load_state_dict(loaded['rflow_state'])
-    elif 'ema_state' in loaded:
-        rflow_model.load_state_dict(loaded['ema_state'])
-        printf('Loaded EMA weights (legacy).')
-    else:
-        rflow_model.load_state_dict(loaded['state_dict'])
-
-    if 'context_state_ema' in loaded:
-        context_embedder.load_state_dict(loaded['context_state_ema'])
-        printf('Loaded Context EMA weights.')
-    elif 'context_state' in loaded:
-        context_embedder.load_state_dict(loaded['context_state'])
-    else:
-        printf('Warning: No ContextEmbedder state found in checkpoint.')
+    if 'condition_encoder_state_ema' in rflow_ckpt:
+        printf('Loaded condition encoder EMA weights.')
 
     rflow_model.eval().float()
-    context_embedder.eval().float()
+    condition_encoder.eval().float()
+    printf('Param:\t {0:.2f} B'.format(sum(p.numel() for p in rflow_model.parameters()) / 1e9))
 
-    return *vae_dual, (rflow_model, context_embedder)
+    cls_weight = _release_weight('metal_cls_generated_best.pt', metal_cls_path)
+
+    printf('MetalCls:\t {0}'.format(cls_weight.resolve()))
+    cls_ckpt = torch.load(cls_weight, map_location=device, weights_only=False)
+    numeric_class_values = cls_ckpt.get('numeric_class_values') or build_numeric_bins()
+    numeric_class_values = {name: tuple(numeric_class_values[name]) for name in NUMERIC_LABEL_NAMES}
+    metal_cls = MetalGeometryCls({name: len(numeric_class_values[name]) for name in NUMERIC_LABEL_NAMES}).to(device)
+    metal_cls.load_state_dict(cls_ckpt['model'])
+    metal_cls.eval().float()
+    printf('Epoch:\t {0}'.format(cls_ckpt.get('epoch')))
+    printf('Domain:\t {0}'.format(cls_ckpt.get('domain')))
+    printf('Best score:\t {0}'.format(cls_ckpt.get('best_score')))
+
+    cls_meta = {
+        'numeric_class_values': numeric_class_values,
+        'epoch': cls_ckpt.get('epoch'),
+        'domain': cls_ckpt.get('domain'),
+        'best_score': cls_ckpt.get('best_score'),
+        'path': cls_weight,
+    }
+    return *vae_dual, rflow_model, condition_encoder, metal_cls, cls_meta
 
 
-def i2_context_embed(
-    context_embedder, stem_brand=None, stem_size=None, cup_outer=None, head_outer=None, head_offset=None, liner_offset=None, cpu=False
+def i2_encode_condition(
+    stem_brand=None,
+    stem_size=None,
+    cup_outer=None,
+    head_outer=None,
+    head_offset=None,
+    liner_offset=None,
+    cpu=False,
 ):
-    if cpu:
-        device = torch.device('cpu')
-    else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    brand_to_id = {b: i for i, b in enumerate(BRANDS)}
-    size_to_id = {s: i for i, s in enumerate(SIZES)}
-
-    brand_val = stem_brand if stem_brand is not None else ''
-    size_val = stem_size if stem_size is not None else ''
-
-    if size_val and not brand_val:
-        raise ValueError('Cannot specify stem_size without specifying stem_brand.')
-
-    if brand_val not in FEMORAL:
-        raise ValueError(f"Unknown stem_brand: '{brand_val}'. Supported brands are: {list(FEMORAL.keys())}")
-
-    if size_val not in FEMORAL[brand_val]:
-        raise ValueError(f"Unknown stem_size: '{size_val}' for brand '{brand_val}'. Supported sizes are: {FEMORAL[brand_val]}")
-
-    brand_id = brand_to_id.get(brand_val, 0)
-    brand_mask = 1.0 if brand_val in brand_to_id else 0.0
-
-    size_id = size_to_id.get(size_val, 0)
-    size_mask = 1.0 if size_val in size_to_id else 0.0
-
-    def min_max_scale(val, min_val, max_val):
-        if val is None or val == '':
-            return 0.0, 0.0
-        return 2.0 * (float(val) - min_val) / (max_val - min_val) - 1.0, 1.0
-
-    cup_outer_val, cup_outer_mask = min_max_scale(cup_outer, *CUP_OUTER[:2])
-    head_outer_val, head_outer_mask = min_max_scale(head_outer, *HEAD_OUTER[:2])
-    head_offset_val, head_offset_mask = min_max_scale(head_offset, *HEAD_OFFSET[:2])
-    liner_offset_val, liner_offset_mask = min_max_scale(liner_offset, *LINER_OFFSET[:2])
-
-    nums = [cup_outer_val, head_outer_val, head_offset_val, liner_offset_val]
-    masks = [brand_mask, size_mask, cup_outer_mask, head_outer_mask, head_offset_mask, liner_offset_mask]
-
-    b_id, s_id, nums, msks = (
-        torch.tensor([brand_id], dtype=torch.long).to(device),
-        torch.tensor([size_id], dtype=torch.long).to(device),
-        torch.tensor([nums], dtype=torch.float32).to(device),
-        torch.tensor([masks], dtype=torch.float32).to(device),
+    device = _device(cpu)
+    encoded = define.PrepareProsthesisConditiond(keys=['context'])({
+        'context': {
+            'femoral_spec': [stem_brand or '', stem_size or ''],
+            'cup_outer': cup_outer,
+            'head_outer': head_outer,
+            'head_offset': head_offset,
+            'liner_offset': liner_offset,
+        }
+    })
+    return (
+        encoded['stem_model_id'].unsqueeze(0).to(device),
+        encoded['stem_spec_id'].unsqueeze(0).to(device),
+        encoded['numerics'].unsqueeze(0).to(device),
+        encoded['masks'].unsqueeze(0).to(device),
     )
 
-    with torch.no_grad():
-        context_emb = context_embedder(b_id, s_id, nums, msks)
-        context_emb_uncond = context_embedder(b_id, s_id, nums, torch.zeros_like(msks))
 
-    return context_emb, context_emb_uncond
+def _encode_nifti(path, vae_model, scale_factor, mean, channels, sw_batch_size=4, sw_overlap=0.25, cpu=False, amp=True):
+    device = _device(cpu)
+    path = Path(path)
+    if not path.exists():
+        raise RuntimeError(f'Image not found:\t {path.resolve()}')
 
-
-def i3_pre_encode(pre_path, vae_model, scale_factor, mean, channels, sw_batch_size=4, sw_overlap=0.25, cpu=False, amp=True):
-    if cpu:
-        device = torch.device('cpu')
-    else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    pre_path = Path(pre_path)
-    if not pre_path.exists():
-        raise RuntimeError(f'Pre image not found:\t {pre_path.resolve()}')
-
-    itk_img = itk.imread(pre_path.as_posix())
-    pre_origin = list(itk.origin(itk_img))
-    pre_spacing = list(itk.spacing(itk_img))
-    pre_size = list(itk.size(itk_img))
-
-    direction = itk.GetArrayFromMatrix(itk_img.GetDirection())
-
-    # 加载并归一化条件图像 [B, C, H, W, D]
-    # MONAI ITKReader loads in (C, X, Y, Z) order
     transforms = Compose([
         LoadImaged(keys=['image'], reader='ITKReader'),
         EnsureChannelFirstd(keys=['image'], channel_dim=-1 if channels > 1 else 'no_channel'),
@@ -534,14 +341,11 @@ def i3_pre_encode(pre_path, vae_model, scale_factor, mean, channels, sw_batch_si
         SpatialPadd(keys=['image'], spatial_size=(128, 128, 128), constant_values=-1.0),
         DivisiblePadd(keys=['image'], k=16, constant_values=-1.0),
     ])
+    data = cast(dict, transforms({'image': path.as_posix()}))
+    tensor = data['image'].unsqueeze(0).to(device)
 
-    data = cast(dict, transforms({'image': pre_path.as_posix()}))
-    raw = data['image']
-    tensor = raw.unsqueeze(0).to(device)
-
-    # VAE 编码 (Encoding)
     def encode_predictor(z):
-        with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
+        with _amp_context(device, amp):
             return vae_model.encode(z)[0]
 
     with torch.no_grad():
@@ -556,20 +360,47 @@ def i3_pre_encode(pre_path, vae_model, scale_factor, mean, channels, sw_batch_si
             progress=False,
         )
 
-    # 缩放 latent 分布
-    encoded = (encoded - mean) * scale_factor
+    return (encoded - mean) * scale_factor
 
+
+def i3_pre_encode(pre_path, vae_model, scale_factor, mean, channels, sw_batch_size=4, sw_overlap=0.25, cpu=False, amp=True):
+    pre_path = Path(pre_path)
+    itk_img = itk.imread(pre_path.as_posix())
+    pre_origin = list(itk.origin(itk_img))
+    pre_spacing = list(itk.spacing(itk_img))
+    pre_size = list(itk.size(itk_img))
+    direction = itk.GetArrayFromMatrix(itk_img.GetDirection())
+    encoded = _encode_nifti(pre_path, vae_model, scale_factor, mean, channels, sw_batch_size, sw_overlap, cpu, amp)
     return encoded, pre_origin, pre_spacing, pre_size, direction
 
 
-def i4_rflow_sample(rflow_model, context_emb, uncond_context_emb, pre_encoded, seed=None, ts=5, cfg=1.0, cpu=False, amp=True):
-    if cpu:
-        device = torch.device('cpu')
-    else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def i3_metal_encode(cup_path, stem_path, vae_model, scale_factor, mean, channels, sw_batch_size=4, sw_overlap=0.25, cpu=False, amp=True):
+    z_cup = _encode_nifti(cup_path, vae_model, scale_factor, mean, channels, sw_batch_size, sw_overlap, cpu, amp)
+    z_stem = _encode_nifti(stem_path, vae_model, scale_factor, mean, channels, sw_batch_size, sw_overlap, cpu, amp)
+    return torch.cat([z_cup, z_stem], dim=1)
+
+
+def i4_rflow_sample(
+    rflow_model,
+    condition_encoder,
+    pre_encoded,
+    stem_model_id,
+    stem_spec_id,
+    numerics,
+    masks,
+    mode='bone_only',
+    seed=None,
+    ts=5,
+    cpu=False,
+    amp=True,
+):
+    device = _device(cpu)
+    bone_latent, masks = define.apply_prosthesis_condition_mode(pre_encoded, masks, mode)
+    with torch.no_grad():
+        context = condition_encoder(stem_model_id, stem_spec_id, numerics, masks)
 
     if seed is not None:
-        generator = torch.Generator(device=device).manual_seed(seed)
+        generator = torch.Generator(device=device).manual_seed(int(seed))
     else:
         generator = None
 
@@ -577,53 +408,29 @@ def i4_rflow_sample(rflow_model, context_emb, uncond_context_emb, pre_encoded, s
     gen_shape[1] = 8
     generated = torch.randn(gen_shape, device=device, generator=generator)
 
-    scheduler = RFlowScheduler(num_train_timesteps=1000)
-    scheduler.set_timesteps(ts)
-    all_timesteps = scheduler.timesteps
-    all_next_timesteps = torch.cat((all_timesteps[1:], torch.tensor([0], dtype=all_timesteps.dtype, device=all_timesteps.device)))
+    scheduler = define.scheduler_rflow()
+    scheduler.set_timesteps(num_inference_steps=ts)
+    all_timesteps = scheduler.timesteps.to(device)
+    all_next_timesteps = torch.cat([all_timesteps[1:], torch.zeros(1, dtype=all_timesteps.dtype, device=device)])
 
     for t, next_t in zip(all_timesteps, all_next_timesteps):
-        # 预测直线速度场 (Velocity)
+        with torch.no_grad(), _amp_context(device, amp):
+            model_input = torch.cat([generated, bone_latent], dim=1)
+            timestep = t.expand(generated.shape[0]).to(device)
+            velocity_pred = rflow_model(model_input, timestep, context=context)
         with torch.no_grad():
-            if cfg > 1.0:
-                with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
-                    model_input_cond = torch.cat([generated, pre_encoded], dim=1)
-                    velocity_cond = rflow_model(model_input_cond, t[None].to(device), context=context_emb)
-
-                    model_input_uncond = torch.cat([generated, torch.zeros_like(pre_encoded)], dim=1)
-                    velocity_uncond = rflow_model(model_input_uncond, t[None].to(device), context=uncond_context_emb)
-
-                velocity_pred = velocity_uncond + cfg * (velocity_cond - velocity_uncond)
-            elif cfg == 1.0:
-                model_input = torch.cat([generated, pre_encoded], dim=1)
-                with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
-                    velocity_pred = rflow_model(model_input, t[None].to(device), context=context_emb)
-            else:
-                model_input = torch.cat([generated, torch.zeros_like(pre_encoded)], dim=1)
-                with autocast(device.type) if amp and device.type != 'cpu' else nullcontext():
-                    velocity_pred = rflow_model(model_input, t[None].to(device), context=uncond_context_emb)
-
-        # Euler 更新步 (x_next = x_t + dt * v_t)
-        with torch.no_grad():
-            generated, _ = scheduler.step(velocity_pred, t, generated, next_t)  # type: ignore
+            generated, _ = scheduler.step(velocity_pred, t, generated, next_t)
 
     return generated
 
 
 def i5_metal_decode(generated, roi_size, vae_model, scale_factor, mean, channels, sw_batch_size=4, sw_overlap=0.25, cpu=False, amp=True):
-    if cpu:
-        device = torch.device('cpu')
-    else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+    device = _device(cpu)
     cropper = CenterSpatialCrop(roi_size=roi_size)
-
-    # 反向缩放
     z = generated / scale_factor + mean
 
-    # VAE 解码
     def decode_predictor(inputs: torch.Tensor) -> torch.Tensor:
-        with autocast(device.type) if amp else nullcontext():
+        with _amp_context(device, amp):
             vae_latent_ch = vae_model.latent_channels
             if inputs.shape[1] > vae_latent_ch:
                 recons = []
@@ -645,11 +452,9 @@ def i5_metal_decode(generated, roi_size, vae_model, scale_factor, mean, channels
             progress=False,
         )
 
-    # 还原尺寸
     decoded = recon[0].detach().cpu().float()
     decoded = cropper(decoded)
     decoded_np = decoded.cpu().numpy()
-
     return np.ascontiguousarray(decoded_np[0]), np.ascontiguousarray(decoded_np[1])
 
 
@@ -694,6 +499,51 @@ def i6_export(savedir, cup, stem, pre_path, origin, spacing, direction, cpu=Fals
     itk.imwrite(seg_img, savedir / 'metal.nii.gz')
 
 
+@torch.no_grad()
+def i7_classify_metal(metal_cls, metal_latent, numeric_class_values, cpu=False, amp=True):
+    device = _device(cpu)
+    if not torch.is_tensor(metal_latent):
+        metal_latent = torch.from_numpy(np.asarray(metal_latent))
+    if metal_latent.ndim == 4:
+        metal_latent = metal_latent.unsqueeze(0)
+    metal_latent = metal_latent.to(device=device, dtype=torch.float32)
+
+    with _amp_context(device, amp):
+        outputs = metal_cls(metal_latent)
+
+    model_prob = torch.softmax(outputs['stem_model'].float(), dim=1)[0]
+    topk = min(3, int(model_prob.numel()))
+    top_p, top_i = model_prob.topk(topk)
+    model_id = int(top_i[0])
+
+    spec_logits = outputs['stem_spec'].float()
+    allowed = build_stem_spec_model_mask(spec_logits.device)[model_id]
+    if bool(allowed.any()):
+        spec_logits = spec_logits.masked_fill(~allowed.unsqueeze(0), -1e9)
+    spec_prob = torch.softmax(spec_logits, dim=1)[0]
+    spec_id = int(spec_prob.argmax())
+    spec_model, spec_size = define.FEMORAL_STEM_SPECS[spec_id]
+
+    result = {
+        'stem_model': {
+            'label': define.FEMORAL_STEM_MODELS[model_id],
+            'prob': float(model_prob[model_id]),
+            'top3': [(define.FEMORAL_STEM_MODELS[int(index)], float(prob)) for prob, index in zip(top_p, top_i)],
+        },
+        'stem_spec': {
+            'label': spec_size,
+            'model': spec_model,
+            'prob': float(spec_prob[spec_id]),
+        },
+    }
+    for name in NUMERIC_LABEL_NAMES:
+        dist = torch.softmax(outputs[name].float(), dim=1)[0]
+        index = int(dist.argmax())
+        values = list(numeric_class_values[name])
+        result[name] = {'label': float(values[index]), 'prob': float(dist[index])}
+    return result
+
+
 if __name__ == '__main__':
     import tomlkit
 
@@ -703,11 +553,20 @@ if __name__ == '__main__':
     prl = list(cfg['test'].keys())[1]
     pre_path = Path(cfg['train']['root']) / 'dataset' / 'pre' / f'{prl}.nii.gz'
 
-    vae_pre, vae_metal, (rflow, context_embedder) = i1_load_models()
-    context_emb, context_emb_uncond = i2_context_embed(context_embedder)
+    vae_pre, vae_metal, rflow, condition_encoder, metal_cls, cls_meta = i1_load_models()
+    stem_model_id, stem_spec_id, numerics, masks = i2_encode_condition()
     pre_encoded, pre_origin, pre_spacing, pre_size, direction = i3_pre_encode(pre_path, *vae_pre)
-    metal_latent = i4_rflow_sample(rflow, context_emb, context_emb_uncond, pre_encoded)
+    metal_latent = i4_rflow_sample(
+        rflow,
+        condition_encoder,
+        pre_encoded,
+        stem_model_id,
+        stem_spec_id,
+        numerics,
+        masks,
+        mode='bone_only',
+    )
+    pred = i7_classify_metal(metal_cls, metal_latent, cls_meta['numeric_class_values'])
     cup, stem = i5_metal_decode(metal_latent, pre_size, *vae_metal)
     i6_export('save_infer', cup, stem, pre_path, pre_origin, pre_spacing, direction)
-
-    print(pre_size, cup.shape, stem.shape)
+    print(pre_size, cup.shape, stem.shape, pred['stem_model'])

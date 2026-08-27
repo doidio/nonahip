@@ -14,17 +14,24 @@ import streamlit as st
 import tomlkit
 import torch
 from infer import (
-    CUP_OUTER,
-    FEMORAL,
-    HEAD_OFFSET,
-    HEAD_OUTER,
-    LINER_OFFSET,
+    CONDITION_MODE_LABELS,
+    CONDITION_MODE_PARAM_LEVEL,
+    NUMERIC_FALLBACKS,
+    NUMERIC_LABEL_NAMES,
+    NUMERIC_OPTIONS,
+    STEM_MODELS,
+    case_prosthesis_values,
+    format_condition_desc,
     i1_load_models,
-    i2_context_embed,
+    i2_encode_condition,
+    i3_metal_encode,
     i3_pre_encode,
     i4_rflow_sample,
     i5_metal_decode,
     i6_export,
+    i7_classify_metal,
+    nearest_numeric,
+    specs_for_model,
 )
 
 st.set_page_config('Nonahip', initial_sidebar_state='collapsed', layout='wide')
@@ -68,37 +75,55 @@ def cache_load_pairs(config_file: str):
 
 
 def it_desc(it):
-    label = []
+    values = case_prosthesis_values(it.get('context', {}))
+    return format_condition_desc(seed=it.get('seed'), **values)
 
-    spec = it['context']['femoral_spec']
 
-    if spec[0] is not None and len(str(spec[0])):
-        label.append(f'柄型号 {str(spec[0])}')
+def _option_index(options, value, fallback=0):
+    options = list(options)
+    if value in options:
+        return options.index(value)
+    return fallback if 0 <= fallback < len(options) else 0
 
-    if spec[1] is not None and len(str(spec[1])):
-        label.append(f'柄规格 {str(spec[1])}')
 
-    cup_outer = it['context'].get('cup_outer_best', it['context'].get('cup_outer'))
+def _format_mm(name, value):
+    if name in ('cup_outer', 'head_outer'):
+        return f'{float(value):.0f} mm'
+    if name == 'head_offset':
+        return f'{float(value):+g} mm'
+    return f'{float(value):g} mm'
 
-    if cup_outer is not None and len(str(cup_outer)):
-        label.append(f'杯直径 {str(cup_outer)}')
 
-    liner_offset = it['context'].get('liner_offset_best', it['context'].get('liner_offset'))
+def _format_condition_value(name, value):
+    if value is None or value == '':
+        return '—'
+    if name in NUMERIC_LABEL_NAMES:
+        return _format_mm(name, value)
+    return str(value)
 
-    if liner_offset is not None and len(str(liner_offset)):
-        label.append(f'衬偏心 {str(liner_offset)}')
 
-    head_outer = it['context'].get('head_outer')
-
-    if head_outer is not None and len(str(head_outer)):
-        label.append(f'头直径 {str(head_outer)}')
-
-    seed = it.get('seed')
-
-    if seed is not None and len(str(seed)):
-        label.append(f'种子 {str(seed)}')
-
-    return ' '.join(label)
+def _compare_rows(cond_values, pred):
+    cond_values = cond_values or {}
+    fields = [
+        ('stem_model', '柄型号', 'stem_model'),
+        ('stem_size', '柄规格', 'stem_spec'),
+        ('cup_outer', '杯直径', 'cup_outer'),
+        ('head_outer', '头直径', 'head_outer'),
+        ('head_offset', '头偏距', 'head_offset'),
+        ('liner_offset', '衬偏心', 'liner_offset'),
+    ]
+    rows = []
+    for cond_key, label, pred_key in fields:
+        cond_text = _format_condition_value(cond_key, cond_values.get(cond_key))
+        if pred:
+            item = pred[pred_key]
+            pred_text = _format_mm(pred_key, item['label']) if pred_key in NUMERIC_LABEL_NAMES else (item['label'] or '未标注')
+            prob_text = f'{item["prob"]:.1%}'
+        else:
+            pred_text = '—'
+            prob_text = '—'
+        rows.append((label, cond_text, pred_text, prob_text))
+    return rows
 
 
 def fast_drr(a, ax, th=(0.05, 1.0), mode: Literal['mean', 'max'] = 'mean'):
@@ -257,143 +282,233 @@ else:
 
     cols = st.columns([1, 3])
 
-    top_cols = cols[1].columns([1, 1, 1, 1, 1, 1], vertical_alignment='bottom')
+    top_cols = cols[1].columns([2, 1, 1], vertical_alignment='bottom')
     sub_cols = cols[1].columns([4, 1, 1])
 
     stx = st.container()
     log = st.expander('日志', expanded=True)
 
     canvas = {'术前': pre, '术后对齐骨盆': post_align_hip, '术后对齐股骨': post_align_femur}
-    canvas_t = cols[0].radio('空间', list(canvas.keys()), horizontal=True)
+    canvas_t = cols[0].radio('空间', list(canvas.keys()), horizontal=False)
     canvas = canvas[canvas_t]
 
     ax = {'正位': 1, '侧位': 0, '轴位': 2}
-    ax_t = cols[0].radio('方位', list(ax.keys()), horizontal=True)
+    ax_t = cols[0].radio('方位', list(ax.keys()), horizontal=False)
     ax = ax[ax_t]
 
-    render_t = cols[0].radio('渲染', ['透视', '断层', '三维（暂不支持）'], horizontal=True)
+    defaults = case_prosthesis_values(it.get('context', {}))
+    mode = sub_cols[0].selectbox(
+        '条件模式',
+        list(CONDITION_MODE_LABELS.keys()),
+        index=list(CONDITION_MODE_LABELS).index('bone_only'),
+        format_func=lambda key: CONDITION_MODE_LABELS[key],
+    )
+    param_level = CONDITION_MODE_PARAM_LEVEL[mode]
+    sub_cols[0].caption('与训练时的六种条件接口一致。')
 
-    cn = cols[0].number_input('列数', 1, 100, 10, 1, width=200)
+    stem_brand = stem_size = cup_outer = head_outer = head_offset = liner_offset = None
 
-    is_cond = False
-
-    if sub_cols[0].checkbox('股骨柄型号'):
-        is_cond = True
-        stem_brand = sub_cols[0].radio('型号', [_ for _ in FEMORAL.keys() if len(_)], horizontal=True, label_visibility='collapsed')
-
-        if sub_cols[0].checkbox('股骨柄规格'):
-            stem_size = sub_cols[0].radio('规格', [_ for _ in FEMORAL[stem_brand] if len(_)], horizontal=True, label_visibility='collapsed')
-        else:
-            stem_size = None
-    else:
-        stem_brand, stem_size = None, None
-
-    if sub_cols[1].checkbox('杯直径'):
-        is_cond = True
-        cup_outer = sub_cols[1].number_input('杯直径', CUP_OUTER[0], CUP_OUTER[1], CUP_OUTER[2], CUP_OUTER[3], label_visibility='collapsed')
-    else:
-        cup_outer = None
-
-    if sub_cols[1].checkbox('头直径'):
-        is_cond = True
-        head_outer = sub_cols[1].number_input('头直径', HEAD_OUTER[0], HEAD_OUTER[1], HEAD_OUTER[2], HEAD_OUTER[3], label_visibility='collapsed')
-    else:
-        head_outer = None
-
-    if sub_cols[2].checkbox('头偏距'):
-        is_cond = True
-        head_offset = sub_cols[2].number_input('头偏距', HEAD_OFFSET[0], HEAD_OFFSET[1], HEAD_OFFSET[2], HEAD_OFFSET[3], label_visibility='collapsed')
-    else:
-        head_offset = None
-
-    if sub_cols[2].checkbox('衬偏心'):
-        is_cond = True
-        liner_offset = sub_cols[2].number_input(
-            '衬偏心', LINER_OFFSET[0], LINER_OFFSET[1], LINER_OFFSET[2], LINER_OFFSET[3], label_visibility='collapsed'
+    if param_level in ('model', 'model_spec', 'full'):
+        stem_brand = sub_cols[0].selectbox(
+            '柄型号',
+            STEM_MODELS,
+            index=_option_index(STEM_MODELS, defaults['stem_model']),
         )
-    else:
-        liner_offset = None
+    if param_level in ('model_spec', 'full') and stem_brand is not None:
+        spec_options = specs_for_model(stem_brand)
+        if spec_options:
+            stem_size = sub_cols[0].selectbox(
+                '柄规格',
+                spec_options,
+                index=_option_index(spec_options, defaults['stem_size']),
+            )
 
-    if top_cols[3].checkbox('可复现'):
-        seed = top_cols[2].number_input('复现种子', 0, None, 42, 1)
-        samples = 1
-    else:
-        seed = None
-        samples = top_cols[2].number_input('采样数量', 1, 100, 10, 1)
+    if param_level == 'full':
+        cup_outer = sub_cols[1].selectbox(
+            '杯直径',
+            NUMERIC_OPTIONS['cup_outer'],
+            index=_option_index(
+                NUMERIC_OPTIONS['cup_outer'],
+                nearest_numeric(defaults['cup_outer'], NUMERIC_OPTIONS['cup_outer'], NUMERIC_FALLBACKS['cup_outer']),
+            ),
+            format_func=lambda value: _format_mm('cup_outer', value),
+        )
+        head_outer = sub_cols[1].selectbox(
+            '头直径',
+            NUMERIC_OPTIONS['head_outer'],
+            index=_option_index(
+                NUMERIC_OPTIONS['head_outer'],
+                nearest_numeric(defaults['head_outer'], NUMERIC_OPTIONS['head_outer'], NUMERIC_FALLBACKS['head_outer']),
+            ),
+            format_func=lambda value: _format_mm('head_outer', value),
+        )
+        head_offset = sub_cols[2].selectbox(
+            '头偏距',
+            NUMERIC_OPTIONS['head_offset'],
+            index=_option_index(
+                NUMERIC_OPTIONS['head_offset'],
+                nearest_numeric(defaults['head_offset'], NUMERIC_OPTIONS['head_offset'], NUMERIC_FALLBACKS['head_offset']),
+            ),
+            format_func=lambda value: _format_mm('head_offset', value),
+        )
+        liner_offset = sub_cols[2].selectbox(
+            '衬偏心',
+            NUMERIC_OPTIONS['liner_offset'],
+            index=_option_index(
+                NUMERIC_OPTIONS['liner_offset'],
+                nearest_numeric(defaults['liner_offset'], NUMERIC_OPTIONS['liner_offset'], NUMERIC_FALLBACKS['liner_offset']),
+            ),
+            format_func=lambda value: _format_mm('liner_offset', value),
+        )
+    elif param_level is None:
+        sub_cols[1].caption('此模式不注入假体参数，由分类器从生成几何中读出。')
 
-    timestemps = top_cols[4].number_input('采样步数 (Timesteps)', 1, 50, 5, 1)
-    cf_guidance = top_cols[5].number_input('无分类器引导 (Classifier-Free Guidance)', 0.0, 9.0, 1.0, 1.0)
+    seed = top_cols[2].number_input('随机种子', 0, None, 42, 1)
 
     if top_cols[1].button('清空'):
-        del st.session_state['generated']
+        st.session_state.pop('generated', None)
+        st.session_state.pop('real_pred', None)
         st.rerun()
 
-    if top_cols[0].button('条件生成' if is_cond else '无条件生成', width='stretch'):
-        desc = it_desc({
-            'prl': prl,
-            'context': {
-                'femoral_spec': [stem_brand, stem_size],
-                'cup_outer': cup_outer,
-                'head_outer': head_outer,
-                'head_offset': head_offset,
-                'liner_offset': liner_offset,
-            },
+    if top_cols[0].button(f'{CONDITION_MODE_LABELS[mode]}生成', width='stretch'):
+        condition = {
+            'mode': mode,
+            'stem_model': stem_brand,
+            'stem_size': stem_size,
+            'cup_outer': cup_outer,
+            'head_outer': head_outer,
+            'head_offset': head_offset,
+            'liner_offset': liner_offset,
             'seed': seed,
-        })
+        }
 
         bar = stx.progress(0.0, '载入模型')
-        vae_pre, vae_metal, (rflow, context_embedder) = i1_load_models(printf=lambda *args: log.caption('\t'.join(str(_) for _ in args)))
+        vae_pre, vae_metal, rflow, condition_encoder, metal_cls, cls_meta = i1_load_models(
+            printf=lambda *args: log.caption('\t'.join(str(_) for _ in args)),
+        )
 
-        bar.progress(0.2, '编码全局标签')
-        context_emb, context_emb_uncond = i2_context_embed(context_embedder, stem_brand, stem_size, cup_outer, head_outer, head_offset, liner_offset)
+        bar.progress(0.15, '编码假体条件')
+        stem_model_id, stem_spec_id, numerics, masks = i2_encode_condition(stem_brand, stem_size, cup_outer, head_outer, head_offset, liner_offset)
 
-        bar.progress(0.3, '编码术前图像')
+        bar.progress(0.25, '编码术前图像')
         pre_encoded, *_ = i3_pre_encode(pre_path, *vae_pre)
 
-        metal_latent = []
-        for _ in range(samples):
-            bar.progress(0.3 + 0.2 * (_ + 1) / samples, f'采样假体 {_ + 1} / {samples}')
-            metal_latent.append(i4_rflow_sample(rflow, context_emb, context_emb_uncond, pre_encoded, seed, timestemps, cf_guidance))
+        metal_dir = Path(cfg['train']['root']) / 'dataset' / 'metal'
+        cup_path = metal_dir / f'{prl}_cup.nii.gz'
+        stem_path = metal_dir / f'{prl}_stem.nii.gz'
+        if cup_path.exists() and stem_path.exists():
+            bar.progress(0.32, '判别真实假体')
+            real_latent = i3_metal_encode(cup_path, stem_path, *vae_metal)
+            st.session_state['real_pred'] = i7_classify_metal(metal_cls, real_latent, cls_meta['numeric_class_values'])
+            del real_latent
 
-        metal_tsdf = []
-        for _ in range(samples):
-            bar.progress(0.5 + 0.2 * (_ + 1) / samples, f'解码假体 {_ + 1} / {samples}')
-            metal_tsdf.append(i5_metal_decode(metal_latent[_], pre_size, *vae_metal))
+        bar.progress(0.45, '采样假体')
+        metal_latent = i4_rflow_sample(
+            rflow,
+            condition_encoder,
+            pre_encoded,
+            stem_model_id,
+            stem_spec_id,
+            numerics,
+            masks,
+            mode=mode,
+            seed=seed,
+            ts=5,
+        )
+        bar.progress(0.7, '判别假体')
+        pred = i7_classify_metal(metal_cls, metal_latent, cls_meta['numeric_class_values'])
+        bar.progress(0.85, '解码假体')
+        cup_tsdf, stem_tsdf = i5_metal_decode(metal_latent, pre_size, *vae_metal)
+        del metal_latent
 
         bar.empty()
 
-        del vae_pre, vae_metal, rflow, context_embedder
-        del pre_encoded, metal_latent
+        del vae_pre, vae_metal, rflow, condition_encoder, metal_cls, pre_encoded
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         if 'generated' not in st.session_state:
             st.session_state['generated'] = []
-
-        st.session_state['generated'].extend([(_, desc) for _ in metal_tsdf])
+        st.session_state['generated'].append(
+            {
+                'cup': cup_tsdf,
+                'stem': stem_tsdf,
+                'pred': pred,
+                'condition': condition,
+            }
+        )
 
     def format_func(i):
         if i > 0:
-            (_, _), desc = generated[i - 1]
-            return f'预测 {i} {desc} '
-        else:
-            return '真实'
+            return f'预测 {i}'
+        return '真实'
 
     generated = st.session_state.get('generated', [])
     metal_id = stx.radio('假体', range(len(generated) + 1), horizontal=True, format_func=format_func)
 
+    pred = st.session_state.get('real_pred')
+    cond_values = defaults
+    cond_title = '手术记录'
     if metal_id > 0:
-        (cup, stem), desc = generated[metal_id - 1]
+        item = generated[metal_id - 1]
+        cup, stem = item['cup'], item['stem']
+        pred = item.get('pred')
+        cond_values = item.get('condition') or {}
+        cond_title = '生成条件'
 
-    if render_t == '透视':
-        images = render_drr(prl, canvas_t, ax, canvas, cup, stem)
-    elif render_t == '断层':
-        images = render_slices(prl, canvas_t, ax, canvas, cup, stem)
-    elif render_t == '三维':
-        images = []
-    else:
-        images = []
+    view_cols = stx.columns([1, 1], vertical_alignment='top')
+    with view_cols[0]:
+        st.caption(f'{canvas_t} {ax_t} 透视')
+        drr_images = render_drr(prl, canvas_t, ax, canvas, cup, stem)
+        if drr_images:
+            view_cols[0].image(drr_images[0][1])
+    with view_cols[1]:
+        extra = []
+        if metal_id > 0:
+            extra.append(CONDITION_MODE_LABELS.get(cond_values.get('mode'), ''))
+            if cond_values.get('seed') is not None:
+                extra.append(f'种子 {cond_values["seed"]}')
+        extra.append('生成域分类器')
+        st.caption(f'{cond_title} / ' + ' · '.join(part for part in extra if part))
+        rows = _compare_rows(cond_values, pred)
+        st.dataframe(
+            {
+                '参数': [row[0] for row in rows],
+                cond_title: [row[1] for row in rows],
+                '判别': [row[2] for row in rows],
+                '置信度': [row[3] for row in rows],
+            },
+            hide_index=True,
+            width='stretch',
+        )
+        if pred is None:
+            st.caption('生成一次后会同时判别真实假体与生成假体。')
+        else:
+            if pred.get('stem_model', {}).get('top3'):
+                top3 = '，'.join(f'{label or "未标注"} {prob:.1%}' for label, prob in pred['stem_model']['top3'])
+                st.caption(f'型号 Top-3：{top3}')
+            if (
+                metal_id > 0
+                and cond_values.get('stem_model')
+                and pred['stem_model']['label']
+                and cond_values['stem_model'] != pred['stem_model']['label']
+            ):
+                st.warning(f'指定型号为 {cond_values["stem_model"]}，判别结果为 {pred["stem_model"]["label"]}。骨骼约束可能已改变实际几何。')
+
+    pack_head = stx.columns([1, 1, 6], vertical_alignment='bottom')
+    show_slices = pack_head[0].checkbox('断层')
+    cn = 10
+    if show_slices:
+        cn = pack_head[1].number_input('列数', 1, 100, 10, 1)
+        slice_images = render_slices(prl, canvas_t, ax, canvas, cup, stem)
+        with stx.expander(f'{canvas_t}{ax_t}断层', expanded=True):
+            for i in range(0, len(slice_images), cn):
+                slice_cols = st.columns(cn)
+                for j in range(cn):
+                    if i + j < len(slice_images):
+                        caption, rgb = slice_images[i + j]
+                        slice_cols[j].image(rgb, '{} = {}'.format('XYZ'[ax], caption))
 
     cols = stx.columns([2, 1, 1, 1, 1, 1, 1], vertical_alignment='bottom')
 
@@ -424,11 +539,3 @@ else:
                         zf.write(savedir / 'metal.nii.gz', arcname='metal.nii.gz')
 
             cols[2].download_button('下载', data=memory_file.getvalue(), file_name=f'{savedir.name}.zip', mime='application/zip')
-
-    with stx.expander(f'{canvas_t}{ax_t}{render_t}', expanded=True):
-        for i in range(0, len(images), cn):
-            cols = st.columns(cn)
-            for j in range(cn):
-                if i + j < len(images):
-                    caption, rgb = images[i + j]
-                    cols[j].image(rgb, '{} = {}'.format('XYZ'[ax], caption) if render_t == '断层' else None)
