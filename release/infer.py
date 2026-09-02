@@ -7,7 +7,7 @@ import itk
 import numpy as np
 import torch
 from monai.inferers import sliding_window_inference
-from monai.transforms import CenterSpatialCrop, Compose, DivisiblePadd, EnsureChannelFirstd, Lambdad, LoadImaged, SpatialPadd
+from monai.transforms import Compose, DivisiblePadd, EnsureChannelFirstd, Lambdad, LoadImaged, SpatialPadd
 from torch import autocast
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -424,9 +424,19 @@ def i4_rflow_sample(
     return generated
 
 
+def _center_crop(tensor, roi_size):
+    roi_size = tuple(int(x) for x in roi_size)
+    slices = [slice(None)]
+    for axis, size in enumerate(roi_size):
+        src = int(tensor.shape[axis + 1])
+        start = max(0, (src - size) // 2)
+        stop = min(src, start + size)
+        slices.append(slice(start, stop))
+    return tensor[tuple(slices)]
+
+
 def i5_metal_decode(generated, roi_size, vae_model, scale_factor, mean, channels, sw_batch_size=4, sw_overlap=0.25, cpu=False, amp=True):
     device = _device(cpu)
-    cropper = CenterSpatialCrop(roi_size=roi_size)
     z = generated / scale_factor + mean
 
     def decode_predictor(inputs: torch.Tensor) -> torch.Tensor:
@@ -440,20 +450,24 @@ def i5_metal_decode(generated, roi_size, vae_model, scale_factor, mean, channels
             return vae_model.decode(inputs)
 
     with torch.no_grad():
-        recon = sliding_window_inference(
-            inputs=z,
-            roi_size=[128 // 4 for _ in range(3)],
-            sw_batch_size=sw_batch_size,
-            predictor=decode_predictor,
-            overlap=sw_overlap,
-            mode='gaussian',
-            device=device,
-            sw_device=device,
-            progress=False,
-        )
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='Using a non-tuple sequence for multidimensional indexing')
+            recon = sliding_window_inference(
+                inputs=z,
+                roi_size=(32, 32, 32),
+                sw_batch_size=sw_batch_size,
+                predictor=decode_predictor,
+                overlap=sw_overlap,
+                mode='gaussian',
+                device=device,
+                sw_device=device,
+                progress=False,
+            )
 
     decoded = recon[0].detach().cpu().float()
-    decoded = cropper(decoded)
+    decoded = _center_crop(decoded, roi_size)
     decoded_np = decoded.cpu().numpy()
     return np.ascontiguousarray(decoded_np[0]), np.ascontiguousarray(decoded_np[1])
 

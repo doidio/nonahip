@@ -387,6 +387,22 @@ def resample_roi(
 
 
 @wp.kernel
+def resample_pre(
+    roi_image: wp.array3d(dtype=wp.float32),
+    roi_origin: wp.vec3,
+    roi_spacing: wp.vec3,
+    pre_volume: wp.uint64,
+    pre_origin: wp.vec3,
+    pre_spacing: wp.vec3,
+):
+    i, j, k = wp.tid()
+    pos = roi_origin + wp.cw_mul(roi_spacing, wp.vec3(wp.float32(i), wp.float32(j), wp.float32(k)))
+    uvw = wp.cw_div(pos - pre_origin, pre_spacing)
+    pix = wp.volume_sample_f(pre_volume, uvw, wp.Volume.LINEAR)
+    roi_image[i, j, k] = bone_normalize(pix)
+
+
+@wp.kernel
 def resample_metal(
     hip_image: wp.array3d(dtype=wp.float32),
     fem_image: wp.array3d(dtype=wp.float32),
